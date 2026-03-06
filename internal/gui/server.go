@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/config"
-	"github.com/slipstreamplus/slipstreamplus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
 type APIServer struct {
@@ -34,6 +34,7 @@ func (s *APIServer) Start() error {
 	// API routes
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/reload", s.handleReload)
 	mux.HandleFunc("/api/instance/", s.handleInstance)
 
 	// Serve the embedded HTML dashboard
@@ -98,6 +99,44 @@ func (s *APIServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (s *APIServer) handleReload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Reload config from disk
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("load config: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Preserve binary path from current config
+	if newCfg.SlipstreamBinary == "" {
+		newCfg.SlipstreamBinary = s.cfg.SlipstreamBinary
+	}
+
+	// Reload manager with new config
+	if err := s.manager.Reload(newCfg); err != nil {
+		http.Error(w, fmt.Sprintf("reload: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	*s.cfg = *newCfg
+	log.Printf("[gui] config reloaded and instances restarted")
+	json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
 }
 
 func (s *APIServer) handleInstance(w http.ResponseWriter, r *http.Request) {
@@ -271,7 +310,7 @@ footer a:hover{text-decoration:underline}
     </div>
     <table>
       <thead><tr>
-        <th>ID</th><th>Domain</th><th>Resolver</th><th>Port</th><th>State</th>
+        <th>ID</th><th>Domain</th><th>Resolver</th><th>Port</th><th>Mode</th><th>State</th>
         <th>Connections</th><th>Latency</th><th>Actions</th>
       </tr></thead>
       <tbody id="instance-table"></tbody>
@@ -281,7 +320,10 @@ footer a:hover{text-decoration:underline}
   <div id="tab-config" class="section" style="display:none">
     <div class="section-header">
       <div class="section-title">Configuration</div>
-      <button class="btn primary" onclick="saveConfig()">💾 Save Config</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn primary" onclick="saveConfig()">💾 Save</button>
+        <button class="btn" style="border-color:var(--green);color:var(--green)" onclick="saveAndApply()">🔄 Save & Apply</button>
+      </div>
     </div>
     <div class="config-panel">
       <div class="form-row">
@@ -376,11 +418,14 @@ function updateDashboard(data) {
   const tbody = document.getElementById('instance-table');
   tbody.innerHTML = instances.map(i => {
     const ping = i.last_ping_ms > 0 ? i.last_ping_ms + 'ms' : '—';
+    const mode = (i.mode || 'socks').toUpperCase();
+    const modeColor = i.mode === 'ssh' ? 'var(--blue)' : 'var(--accent2)';
     return '<tr>' +
       '<td>#' + i.id + '</td>' +
       '<td style="font-weight:500">' + esc(i.domain) + '</td>' +
       '<td style="color:var(--text2)">' + esc(i.resolver) + '</td>' +
       '<td>' + i.port + '</td>' +
+      '<td><span style="color:' + modeColor + ';font-size:11px;font-weight:600">' + mode + '</span></td>' +
       '<td><span class="state-badge ' + i.state + '">' + i.state + '</span></td>' +
       '<td>' + i.active_conns + '</td>' +
       '<td>' + ping + '</td>' +
@@ -447,8 +492,17 @@ async function saveConfig() {
 
     if (!r.ok) { const t = await r.text(); toast(t, true); return; }
     currentConfig = cfg;
-    toast('Config saved! Restart to apply changes.');
+    toast('Config saved!');
   } catch(e) { toast('Failed to save config', true); }
+}
+
+async function saveAndApply() {
+  await saveConfig();
+  try {
+    const r = await fetch('/api/reload', {method: 'POST'});
+    if (!r.ok) { const t = await r.text(); toast(t, true); return; }
+    toast('Config saved & applied! Instances reloaded.');
+  } catch(e) { toast('Failed to reload', true); }
 }
 
 fetchStatus();

@@ -11,7 +11,7 @@ import (
 
 type Config struct {
 	Socks            SocksConfig       `json:"socks"`
-	SlipstreamBinary string            `json:"slipstream_binary"`
+	SlipstreamBinary string            `json:"slipstream_binary,omitempty"`
 	Strategy         string            `json:"strategy"`
 	HealthCheck      HealthCheckConfig `json:"health_check"`
 	Instances        []InstanceConfig  `json:"instances"`
@@ -40,51 +40,40 @@ type InstanceConfig struct {
 	Resolver      string          `json:"resolver"`
 	Port          json.RawMessage `json:"port"`
 	Replicas      int             `json:"replicas,omitempty"`
+	Mode          string          `json:"mode,omitempty"`
 	Authoritative bool            `json:"authoritative"`
 	Cert          string          `json:"cert,omitempty"`
+	SSHPort       int             `json:"ssh_port,omitempty"`
+	SSHUser       string          `json:"ssh_user,omitempty"`
+	SSHPassword   string          `json:"ssh_password,omitempty"`
+	SSHKey        string          `json:"ssh_key,omitempty"`
 }
 
-// ParsePorts parses the port field and returns a list of ports.
-// Supports:
-//   - Single int: 17001
-//   - String range: "17001-17004"
 func (ic *InstanceConfig) ParsePorts() ([]int, error) {
 	raw := strings.TrimSpace(string(ic.Port))
-
-	// Try parsing as a simple integer
 	if port, err := strconv.Atoi(raw); err == nil {
 		return []int{port}, nil
 	}
-
-	// Try parsing as a JSON string (quoted)
 	var portStr string
 	if err := json.Unmarshal(ic.Port, &portStr); err == nil {
 		return parsePortRange(portStr)
 	}
-
-	// Try parsing as a JSON number
 	var portNum int
 	if err := json.Unmarshal(ic.Port, &portNum); err == nil {
 		return []int{portNum}, nil
 	}
-
 	return nil, fmt.Errorf("invalid port value: %s", raw)
 }
 
 func parsePortRange(s string) ([]int, error) {
 	s = strings.TrimSpace(s)
-
-	// Single port as string
 	if port, err := strconv.Atoi(s); err == nil {
 		return []int{port}, nil
 	}
-
-	// Range: "start-end"
 	parts := strings.SplitN(s, "-", 2)
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid port range: %s", s)
 	}
-
 	start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
 	if err != nil {
 		return nil, fmt.Errorf("invalid port range start: %s", parts[0])
@@ -93,14 +82,12 @@ func parsePortRange(s string) ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid port range end: %s", parts[1])
 	}
-
 	if start > end {
 		return nil, fmt.Errorf("port range start (%d) must be <= end (%d)", start, end)
 	}
 	if start <= 0 || end > 65535 {
 		return nil, fmt.Errorf("ports must be between 1 and 65535")
 	}
-
 	ports := make([]int, 0, end-start+1)
 	for p := start; p <= end; p++ {
 		ports = append(ports, p)
@@ -108,19 +95,21 @@ func parsePortRange(s string) ([]int, error) {
 	return ports, nil
 }
 
-// ExpandedInstance represents a single expanded instance after replicas are resolved.
 type ExpandedInstance struct {
 	Domain        string
 	Resolver      string
 	Port          int
+	Mode          string // "socks" or "ssh" (per-instance)
 	Authoritative bool
 	Cert          string
-	OriginalIndex int // index in original config
-	ReplicaIndex  int // which replica (0-based)
+	SSHPort       int
+	SSHUser       string
+	SSHPassword   string
+	SSHKey        string
+	OriginalIndex int
+	ReplicaIndex  int
 }
 
-// ExpandInstances expands all instance configs into individual instances
-// based on replicas and port ranges.
 func (c *Config) ExpandInstances() ([]ExpandedInstance, error) {
 	var result []ExpandedInstance
 
@@ -136,7 +125,6 @@ func (c *Config) ExpandInstances() ([]ExpandedInstance, error) {
 		}
 
 		if len(ports) == 1 && replicas > 1 {
-			// Single port but multiple replicas: auto-generate ports
 			basePort := ports[0]
 			ports = make([]int, replicas)
 			for r := 0; r < replicas; r++ {
@@ -149,20 +137,30 @@ func (c *Config) ExpandInstances() ([]ExpandedInstance, error) {
 				i, len(ports), replicas)
 		}
 
+		// Resolve mode: per-instance overrides default "socks"
+		mode := inst.Mode
+		if mode == "" {
+			mode = "socks"
+		}
+
 		for r := 0; r < replicas; r++ {
 			result = append(result, ExpandedInstance{
 				Domain:        inst.Domain,
 				Resolver:      inst.Resolver,
 				Port:          ports[r],
+				Mode:          mode,
 				Authoritative: inst.Authoritative,
 				Cert:          inst.Cert,
+				SSHPort:       inst.SSHPort,
+				SSHUser:       inst.SSHUser,
+				SSHPassword:   inst.SSHPassword,
+				SSHKey:        inst.SSHKey,
 				OriginalIndex: i,
 				ReplicaIndex:  r,
 			})
 		}
 	}
 
-	// Validate no duplicate ports
 	portSet := make(map[int]bool)
 	for _, ei := range result {
 		if portSet[ei.Port] {
@@ -195,16 +193,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-
 	cfg := &Config{}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
-
 	return cfg, nil
 }
 
@@ -241,9 +236,27 @@ func (c *Config) Validate() error {
 		if inst.Port == nil {
 			return fmt.Errorf("instances[%d].port is required", i)
 		}
+
+		// Validate per-instance mode
+		switch inst.Mode {
+		case "", "socks", "ssh":
+		default:
+			return fmt.Errorf("instances[%d].mode invalid: %s (valid: socks, ssh)", i, inst.Mode)
+		}
+
+		if inst.Mode == "ssh" {
+			if inst.SSHUser == "" {
+				return fmt.Errorf("instances[%d].ssh_user is required in ssh mode", i)
+			}
+			if inst.SSHPassword == "" && inst.SSHKey == "" {
+				return fmt.Errorf("instances[%d]: ssh_password or ssh_key is required in ssh mode", i)
+			}
+			if inst.SSHPort <= 0 {
+				c.Instances[i].SSHPort = 22
+			}
+		}
 	}
 
-	// Validate expansion works
 	if _, err := c.ExpandInstances(); err != nil {
 		return err
 	}
@@ -257,7 +270,6 @@ func (c *Config) Validate() error {
 	if c.HealthCheck.Timeout == "" {
 		c.HealthCheck.Timeout = "5s"
 	}
-
 	if c.GUI.Listen == "" {
 		c.GUI.Listen = "127.0.0.1:8384"
 	}

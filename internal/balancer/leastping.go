@@ -3,7 +3,7 @@ package balancer
 import (
 	"math"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
 type LeastPing struct{}

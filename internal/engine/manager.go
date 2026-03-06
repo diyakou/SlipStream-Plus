@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/config"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
 )
 
 type Manager struct {
@@ -186,4 +186,59 @@ func (m *Manager) Shutdown() {
 
 	m.wg.Wait()
 	log.Printf("[manager] all instances stopped")
+}
+
+// Reload stops all instances, reloads from config, and restarts.
+func (m *Manager) Reload(cfg *config.Config) error {
+	log.Printf("[manager] reloading config...")
+
+	// Stop all current instances
+	for _, inst := range m.instances {
+		if err := inst.Stop(); err != nil {
+			log.Printf("[manager] error stopping instance %d during reload: %v", inst.ID(), err)
+		}
+	}
+	m.wg.Wait()
+
+	// Re-expand from new config
+	m.mu.Lock()
+	binary := cfg.SlipstreamBinary
+	if binary == "" {
+		binary = m.binary // keep embedded binary path
+	} else {
+		m.binary = binary
+	}
+
+	expanded, err := cfg.ExpandInstances()
+	if err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("expand instances: %w", err)
+	}
+
+	// Reset context for new supervisors
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel() // cancel old context
+	m.ctx = ctx
+	m.cancel = cancel
+
+	m.instances = make([]*Instance, len(expanded))
+	for i, ei := range expanded {
+		m.instances[i] = NewInstance(i, ei, binary)
+	}
+	m.mu.Unlock()
+
+	log.Printf("[manager] reload: %d instances expanded", len(expanded))
+
+	// Start all new instances
+	for _, inst := range m.instances {
+		if err := inst.Start(); err != nil {
+			log.Printf("[manager] reload: failed to start instance %d: %v", inst.ID(), err)
+			continue
+		}
+		m.wg.Add(1)
+		go m.supervise(inst)
+	}
+
+	log.Printf("[manager] reload complete: %d instances started", len(m.instances))
+	return nil
 }

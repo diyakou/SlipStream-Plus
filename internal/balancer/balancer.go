@@ -1,7 +1,7 @@
 package balancer
 
 import (
-	"github.com/slipstreamplus/slipstreamplus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
 // Balancer selects an instance for a new connection.

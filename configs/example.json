@@ -4,7 +4,7 @@
     "buffer_size": 65536,
     "max_connections": 10000
   },
-  "slipstream_binary": "./orgslipstream/slipstream-rust/target/release/slipstream-client",
+  "mode": "socks",
   "strategy": "round_robin",
   "health_check": {
     "interval": "10s",

@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/balancer"
-	"github.com/slipstreamplus/slipstreamplus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/balancer"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
 // Server is a transparent TCP load balancer.

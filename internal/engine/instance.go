@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/config"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
 )
 
 type InstanceState int
@@ -60,9 +60,13 @@ func NewInstance(id int, cfg config.ExpandedInstance, binary string) *Instance {
 	}
 }
 
-func (inst *Instance) ID() int {
-	return inst.id
-}
+func (inst *Instance) ID() int                { return inst.id }
+func (inst *Instance) ActiveConns() int64     { return inst.activeConns.Load() }
+func (inst *Instance) IncrConns()             { inst.activeConns.Add(1) }
+func (inst *Instance) DecrConns()             { inst.activeConns.Add(-1) }
+func (inst *Instance) LastPingMs() int64      { return inst.lastPingMs.Load() }
+func (inst *Instance) SetLastPingMs(ms int64) { inst.lastPingMs.Store(ms) }
+func (inst *Instance) Addr() string           { return fmt.Sprintf("127.0.0.1:%d", inst.Config.Port) }
 
 func (inst *Instance) State() InstanceState {
 	inst.mu.RLock()
@@ -80,32 +84,8 @@ func (inst *Instance) IsHealthy() bool {
 	return inst.State() == StateHealthy
 }
 
-func (inst *Instance) ActiveConns() int64 {
-	return inst.activeConns.Load()
-}
-
-func (inst *Instance) IncrConns() {
-	inst.activeConns.Add(1)
-}
-
-func (inst *Instance) DecrConns() {
-	inst.activeConns.Add(-1)
-}
-
-func (inst *Instance) LastPingMs() int64 {
-	return inst.lastPingMs.Load()
-}
-
-func (inst *Instance) SetLastPingMs(ms int64) {
-	inst.lastPingMs.Store(ms)
-}
-
-func (inst *Instance) Addr() string {
-	return fmt.Sprintf("127.0.0.1:%d", inst.Config.Port)
-}
-
 func (inst *Instance) Dial() (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", inst.Addr(), 3*time.Second)
+	conn, err := net.DialTimeout("tcp", inst.Addr(), 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial instance %d (%s): %w", inst.id, inst.Config.Domain, err)
 	}
@@ -134,6 +114,9 @@ func (inst *Instance) Start() error {
 
 	cmd := exec.Command(inst.Binary, args...)
 
+	// Create a new process group so we can kill child + all descendants
+	cmd.SysProcAttr = procAttr()
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -148,9 +131,10 @@ func (inst *Instance) Start() error {
 	}
 
 	inst.cmd = cmd
-	inst.state = StateStarting
+	inst.state = StateHealthy // optimistic
 
 	prefix := fmt.Sprintf("[instance-%d/%s:%d]", inst.id, inst.Config.Domain, inst.Config.Port)
+	log.Printf("%s started (pid=%d, mode=%s)", prefix, cmd.Process.Pid, inst.Config.Mode)
 
 	go func() {
 		scanner := bufio.NewScanner(stdout)
@@ -163,17 +147,6 @@ func (inst *Instance) Start() error {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			log.Printf("%s stderr: %s", prefix, scanner.Text())
-		}
-	}()
-
-	go func() {
-		time.Sleep(2 * time.Second)
-		inst.mu.RLock()
-		currentCmd := inst.cmd
-		inst.mu.RUnlock()
-		if currentCmd != nil && currentCmd.ProcessState == nil {
-			inst.SetState(StateHealthy)
-			log.Printf("%s marked healthy", prefix)
 		}
 	}()
 
@@ -191,9 +164,9 @@ func (inst *Instance) Stop() error {
 	}
 
 	if inst.cmd != nil && inst.cmd.Process != nil {
-		if err := inst.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("kill instance %d: %w", inst.id, err)
-		}
+		pid := inst.cmd.Process.Pid
+		// Kill the entire process group (negative PID)
+		killProcessGroup(pid)
 		inst.cmd.Wait()
 	}
 
@@ -216,12 +189,12 @@ func (inst *Instance) WaitForExit() error {
 	return err
 }
 
-// StatusInfo returns a snapshot of the instance status for the GUI API.
 type StatusInfo struct {
 	ID            int    `json:"id"`
 	Domain        string `json:"domain"`
 	Resolver      string `json:"resolver"`
 	Port          int    `json:"port"`
+	Mode          string `json:"mode"`
 	State         string `json:"state"`
 	ActiveConns   int64  `json:"active_conns"`
 	LastPingMs    int64  `json:"last_ping_ms"`
@@ -235,6 +208,7 @@ func (inst *Instance) StatusInfo() StatusInfo {
 		Domain:        inst.Config.Domain,
 		Resolver:      inst.Config.Resolver,
 		Port:          inst.Config.Port,
+		Mode:          inst.Config.Mode,
 		State:         inst.State().String(),
 		ActiveConns:   inst.ActiveConns(),
 		LastPingMs:    inst.LastPingMs(),

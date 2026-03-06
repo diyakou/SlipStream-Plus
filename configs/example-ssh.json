@@ -1,0 +1,30 @@
+{
+    "socks": {
+        "listen": "0.0.0.0:1080",
+        "buffer_size": 65536,
+        "max_connections": 10000
+    },
+    "mode": "ssh",
+    "strategy": "least_load",
+    "health_check": {
+        "interval": "10s",
+        "target": "google.com",
+        "timeout": "10s"
+    },
+    "gui": {
+        "enabled": true,
+        "listen": "127.0.0.1:8384"
+    },
+    "instances": [
+        {
+            "domain": "u4059842205.execv.shop",
+            "resolver": "62.60.213.14:53",
+            "port": "17001-17004",
+            "replicas": 4,
+            "authoritative": false,
+            "ssh_port": 22,
+            "ssh_user": "parsa",
+            "ssh_password": "kYumQVmxN7SFD0R9"
+        }
+    ]
+}

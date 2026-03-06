@@ -3,7 +3,7 @@ package balancer
 import (
 	"sync/atomic"
 
-	"github.com/slipstreamplus/slipstreamplus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
 type RoundRobin struct {
