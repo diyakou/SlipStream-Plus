@@ -14,6 +14,7 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/gui"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/health"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/proxy"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
 func main() {
@@ -53,7 +54,6 @@ func main() {
 		log.Fatalf("Failed to expand instances: %v", err)
 	}
 
-	// Detect which modes are used
 	hasSSH, hasSOCKS := false, false
 	for _, ei := range expanded {
 		if ei.Mode == "ssh" {
@@ -71,12 +71,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create manager: %v", err)
 	}
-
 	if err := mgr.StartAll(); err != nil {
 		log.Fatalf("Failed to start instances: %v", err)
 	}
 
-	// Health checker (per-instance mode aware, auto-restarts unhealthy)
+	// Health checker
 	checker := health.NewChecker(mgr, &cfg.HealthCheck)
 	checker.Start()
 
@@ -84,12 +83,18 @@ func main() {
 	bal := balancer.New(cfg.Strategy)
 	log.Printf("Using load balancing strategy: %s", cfg.Strategy)
 
+	// User manager (SOCKS5 auth)
+	var userMgr *users.Manager
+	if len(cfg.Socks.Users) > 0 {
+		userMgr = users.NewManager(cfg.Socks.Users)
+	}
+
 	// GUI
 	if *enableGUI || cfg.GUI.Enabled {
 		if *guiPort != "" {
 			cfg.GUI.Listen = *guiPort
 		}
-		apiServer := gui.NewAPIServer(mgr, cfg, *configPath)
+		apiServer := gui.NewAPIServer(mgr, cfg, *configPath, userMgr)
 		if err := apiServer.Start(); err != nil {
 			log.Fatalf("Failed to start GUI: %v", err)
 		}
@@ -107,45 +112,31 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start proxy servers based on which modes are used.
-	// If there are SSH-mode instances, start the SSH SOCKS5 handler.
-	// If there are SOCKS-mode instances, start the TCP relay.
-	// Both share the same listen address — if BOTH modes exist,
-	// SSH instances use SSH tunneling while SOCKS instances use TCP relay.
-	// Since they share a port, we use the mode that handles both:
-	// SSH proxy handles SOCKS5 locally for SSH instances,
-	// TCP relay forwards raw connections for SOCKS instances.
-
+	// Start proxy
 	if hasSSH && !hasSOCKS {
-		// All instances are SSH — use SOCKS5-over-SSH proxy
 		log.Printf("Starting in SSH mode (SOCKS5 → SSH tunnel → slipstream)")
 		sshServer := proxy.NewSSHServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
-			mgr, bal,
+			mgr, bal, userMgr,
 		)
 		defer sshServer.Close()
 		if err := sshServer.ListenAndServe(); err != nil {
 			log.Fatalf("SSH proxy error: %v", err)
 		}
 	} else if !hasSSH && hasSOCKS {
-		// All instances are SOCKS — use transparent TCP relay
-		log.Printf("Starting in SOCKS mode (transparent TCP relay → slipstream)")
+		log.Printf("Starting in SOCKS mode (SOCKS5 → slipstream)")
 		proxyServer := proxy.NewServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
-			mgr, bal,
+			mgr, bal, userMgr,
 		)
 		if err := proxyServer.ListenAndServe(); err != nil {
 			log.Fatalf("Proxy error: %v", err)
 		}
 	} else if hasSSH && hasSOCKS {
-		// Mixed mode: SSH proxy handles SOCKS5 for SSH instances,
-		// TCP relay handles SOCKS instances on a separate port
 		log.Printf("Starting in MIXED mode (SSH + SOCKS instances)")
-		log.Printf("SSH SOCKS5 proxy on %s (for SSH-mode instances)", cfg.Socks.Listen)
-
 		sshServer := proxy.NewSSHServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
-			mgr, bal,
+			mgr, bal, userMgr,
 		)
 		defer sshServer.Close()
 		if err := sshServer.ListenAndServe(); err != nil {

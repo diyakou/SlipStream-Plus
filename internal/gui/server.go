@@ -12,6 +12,7 @@ import (
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
 type APIServer struct {
@@ -19,6 +20,7 @@ type APIServer struct {
 	cfg        *config.Config
 	configPath string
 	listenAddr string
+	userMgr    *users.Manager
 
 	bwMu      sync.RWMutex
 	bwHistory []bwPoint // bandwidth history for daily graph
@@ -32,12 +34,13 @@ type bwPoint struct {
 	Rx   int64 `json:"rx"` // bytes/sec
 }
 
-func NewAPIServer(mgr *engine.Manager, cfg *config.Config, configPath string) *APIServer {
+func NewAPIServer(mgr *engine.Manager, cfg *config.Config, configPath string, umgr *users.Manager) *APIServer {
 	s := &APIServer{
 		manager:    mgr,
 		cfg:        cfg,
 		configPath: configPath,
 		listenAddr: cfg.GUI.Listen,
+		userMgr:    umgr,
 		bwHistory:  make([]bwPoint, 0, 8640),
 	}
 	go s.collectBandwidth()
@@ -80,6 +83,8 @@ func (s *APIServer) Start() error {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/reload", s.handleReload)
 	mux.HandleFunc("/api/bandwidth", s.handleBandwidth)
+	mux.HandleFunc("/api/users", s.handleUsers)
+	mux.HandleFunc("/api/users/", s.handleUserAction)
 	mux.HandleFunc("/api/instance/", s.handleInstance)
 	mux.HandleFunc("/", s.handleDashboard)
 
@@ -215,6 +220,54 @@ func (s *APIServer) handleInstance(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "restarting"})
 }
 
+func (s *APIServer) handleUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if s.userMgr == nil {
+		json.NewEncoder(w).Encode([]any{})
+		return
+	}
+	allUsers := s.userMgr.AllUsers()
+	result := make([]users.UserStatus, len(allUsers))
+	for i, u := range allUsers {
+		result[i] = u.Status()
+	}
+	json.NewEncoder(w).Encode(result)
+}
+
+func (s *APIServer) handleUserAction(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse /api/users/{username}/reset
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 4 || parts[3] != "reset" || s.userMgr == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	username := parts[2]
+	user := s.userMgr.GetUser(username)
+	if user == nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	user.ResetUsedBytes()
+	log.Printf("[gui] reset data counter for user %q", username)
+	json.NewEncoder(w).Encode(map[string]string{"status": "reset"})
+}
+
 func (s *APIServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(dashboardHTML))
@@ -308,6 +361,7 @@ canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);bor
 
   <div class="tabs">
     <button class="tab active" onclick="switchTab('instances',this)">Instances</button>
+    <button class="tab" onclick="switchTab('users',this)">Users</button>
     <button class="tab" onclick="switchTab('graph',this)">Bandwidth</button>
     <button class="tab" onclick="switchTab('config',this)">Config</button>
   </div>
@@ -321,6 +375,19 @@ canvas{width:100%;height:200px;border-radius:var(--rs);background:var(--bg2);bor
         </tr></thead>
         <tbody id="tbl"></tbody>
       </table>
+    </div>
+  </div>
+
+  <div id="tab-users" style="display:none">
+    <div class="panel">
+      <div class="section-hdr"><h3>Users</h3></div>
+      <table>
+        <thead><tr>
+          <th>Username</th><th>BW Limit</th><th>Data Limit</th><th>Used</th><th>IP Limit</th><th>Active IPs</th><th></th>
+        </tr></thead>
+        <tbody id="usr-tbl"></tbody>
+      </table>
+      <div id="no-users" style="text-align:center;padding:20px;color:var(--text3);font-size:12px">No users configured (auth disabled)</div>
     </div>
   </div>
 
@@ -370,11 +437,12 @@ let CC=null;
 function switchTab(t,btn){
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
-  ['instances','graph','config'].forEach(n=>{
+  ['instances','users','graph','config'].forEach(n=>{
     document.getElementById('tab-'+n).style.display=n===t?'block':'none';
   });
   if(t==='config'&&CC)fillForm(CC);
   if(t==='graph')loadBW();
+  if(t==='users')fetchUsers();
 }
 function toast(m,e){const t=document.getElementById('toast');t.textContent=m;t.className='toast show'+(e?' error':'');setTimeout(()=>t.className='toast',3000)}
 function fmt(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'KB';if(b<1073741824)return(b/1048576).toFixed(1)+'MB';return(b/1073741824).toFixed(2)+'GB'}
@@ -415,6 +483,40 @@ async function fetchStatus(){
   }catch(e){}
 }
 
+async function fetchUsers(){
+  try{
+    const r=await fetch('/api/users');
+    const data=await r.json();
+    const tb=document.getElementById('usr-tbl');
+    const nu=document.getElementById('no-users');
+    if(!data||data.length===0){tb.innerHTML='';nu.style.display='block';return}
+    nu.style.display='none';
+    tb.innerHTML=data.map(u=>{
+      const bw=u.bandwidth_limit>0?(u.bandwidth_limit+' '+u.bandwidth_unit):'∞';
+      const dl=u.data_limit>0?(u.data_limit+' '+u.data_unit):'∞';
+      const pct=u.data_limit>0?Math.round(u.data_used_bytes/({gb:1073741824,mb:1048576}[u.data_unit]||1)/u.data_limit*100):0;
+      const bar=u.data_limit>0?'<div style="width:60px;height:4px;background:var(--bg4);border-radius:2px;margin-top:2px"><div style="width:'+Math.min(pct,100)+'%;height:100%;background:'+(pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--green)')+';border-radius:2px"></div></div>':'';
+      const ip=u.ip_limit>0?u.ip_limit:'∞';
+      return '<tr>'+
+        '<td style="font-weight:600;color:var(--accent2)">'+esc(u.username)+'</td>'+
+        '<td>'+bw+'</td>'+
+        '<td>'+dl+'</td>'+
+        '<td>'+fmt(u.data_used_bytes)+bar+'</td>'+
+        '<td>'+ip+'</td>'+
+        '<td>'+u.active_ips+'</td>'+
+        '<td><button class="btn sm" onclick="resetUser(\''+esc(u.username)+'\')">Reset</button></td>'+
+        '</tr>';
+    }).join('');
+  }catch(e){}
+}
+
+async function resetUser(username){
+  try{
+    const r=await fetch('/api/users/'+username+'/reset',{method:'POST'});
+    if(r.ok){toast('Data reset for '+username);fetchUsers()}else{toast('Failed',true)}
+  }catch(e){toast('Failed',true)}
+}
+
 async function restartInst(id){
   try{await fetch('/api/instance/'+id+'/restart',{method:'POST'});toast('Instance #'+id+' restarting...')}catch(e){toast('Failed',true)}
 }
@@ -435,7 +537,7 @@ function fillForm(c){
 async function saveConfig(){
   try{
     let inst;try{inst=JSON.parse(document.getElementById('cfg-inst').value)}catch(e){toast('Invalid JSON',true);return}
-    const cfg={socks:{listen:document.getElementById('cfg-listen').value,buffer_size:parseInt(document.getElementById('cfg-buf').value)||65536,max_connections:parseInt(document.getElementById('cfg-max').value)||10000},slipstream_binary:CC?.slipstream_binary||'',strategy:document.getElementById('cfg-strat').value,health_check:{interval:document.getElementById('cfg-hi').value,target:document.getElementById('cfg-ht').value,timeout:CC?.health_check?.timeout||'5s'},gui:CC?.gui||{},instances:inst};
+    const cfg={socks:{listen:document.getElementById('cfg-listen').value,buffer_size:parseInt(document.getElementById('cfg-buf').value)||65536,max_connections:parseInt(document.getElementById('cfg-max').value)||10000,users:CC?.socks?.users||[]},slipstream_binary:CC?.slipstream_binary||'',strategy:document.getElementById('cfg-strat').value,health_check:{interval:document.getElementById('cfg-hi').value,target:document.getElementById('cfg-ht').value,timeout:CC?.health_check?.timeout||'5s'},gui:CC?.gui||{},instances:inst};
     const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
     if(!r.ok){toast(await r.text(),true);return}CC=cfg;toast('Config saved!')
   }catch(e){toast('Save failed',true)}
@@ -477,7 +579,6 @@ function drawChart(data){
   const pad={t:10,b:24,l:50,r:10};
   const gW=W-pad.l-pad.r,gH=H-pad.t-pad.b;
 
-  // Grid lines
   ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.lineWidth=1;
   for(let i=0;i<5;i++){
     const y=pad.t+gH*i/4;
@@ -494,7 +595,6 @@ function drawChart(data){
       i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
     });
     ctx.stroke();
-    // Fill
     ctx.lineTo(pad.l+gW,pad.t+gH);ctx.lineTo(pad.l,pad.t+gH);ctx.closePath();
     ctx.fillStyle=color.replace(')',',0.08)').replace('rgb','rgba');ctx.fill();
   }
@@ -505,6 +605,7 @@ function drawChart(data){
 fetchStatus();loadCfg();
 setInterval(fetchStatus,2000);
 setInterval(()=>{if(document.getElementById('tab-graph').style.display!=='none')loadBW()},10000);
+setInterval(()=>{if(document.getElementById('tab-users').style.display!=='none')fetchUsers()},3000);
 </script>
 </body>
-</html>`
+</html>` + "\n"

@@ -16,6 +16,7 @@ import (
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/balancer"
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
+	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
 // SSHServer is a SOCKS5 proxy that tunnels connections through SSH over slipstream.
@@ -25,6 +26,7 @@ type SSHServer struct {
 	maxConnections int
 	manager        *engine.Manager
 	balancer       balancer.Balancer
+	userMgr        *users.Manager
 	activeConns    atomic.Int64
 	connID         atomic.Uint64
 	bufPool        sync.Pool
@@ -33,13 +35,14 @@ type SSHServer struct {
 	sshClients map[int]*ssh.Client
 }
 
-func NewSSHServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Manager, bal balancer.Balancer) *SSHServer {
+func NewSSHServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Manager, bal balancer.Balancer, umgr *users.Manager) *SSHServer {
 	return &SSHServer{
 		listenAddr:     listenAddr,
 		bufferSize:     bufferSize,
 		maxConnections: maxConns,
 		manager:        mgr,
 		balancer:       bal,
+		userMgr:        umgr,
 		sshClients:     make(map[int]*ssh.Client),
 		bufPool: sync.Pool{
 			New: func() any {
@@ -71,7 +74,6 @@ func (s *SSHServer) getSSHClient(inst *engine.Instance) (*ssh.Client, error) {
 		return nil, fmt.Errorf("dial slipstream instance: %w", err)
 	}
 
-	// Build SSH auth methods: key file or password
 	var authMethods []ssh.AuthMethod
 	if inst.Config.SSHKey != "" {
 		keyData, err := os.ReadFile(inst.Config.SSHKey)
@@ -132,13 +134,11 @@ func (s *SSHServer) ListenAndServe() error {
 			log.Printf("[ssh-proxy] accept error: %v", err)
 			continue
 		}
-
 		current := s.activeConns.Load()
 		if current >= int64(s.maxConnections) {
 			conn.Close()
 			continue
 		}
-
 		s.activeConns.Add(1)
 		id := s.connID.Add(1)
 		go s.handleConnection(conn, id)
@@ -157,7 +157,9 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetNoDelay(true)
 	}
 
-	// SOCKS5 Auth
+	clientIP := users.ExtractIP(clientConn.RemoteAddr())
+
+	// ──── SOCKS5 Greeting ────
 	buf := make([]byte, 258)
 	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
 		return
@@ -169,9 +171,66 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 	if _, err := io.ReadFull(clientConn, buf[:nMethods]); err != nil {
 		return
 	}
-	clientConn.Write([]byte{0x05, 0x00})
 
-	// SOCKS5 CONNECT
+	requireAuth := s.userMgr != nil && s.userMgr.HasUsers()
+	var user *users.User
+
+	if requireAuth {
+		found := false
+		for i := 0; i < nMethods; i++ {
+			if buf[i] == 0x02 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			clientConn.Write([]byte{0x05, 0xFF})
+			return
+		}
+		clientConn.Write([]byte{0x05, 0x02})
+
+		// RFC 1929 auth
+		if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
+			return
+		}
+		uLen := int(buf[1])
+		if _, err := io.ReadFull(clientConn, buf[:uLen]); err != nil {
+			return
+		}
+		username := string(buf[:uLen])
+
+		if _, err := io.ReadFull(clientConn, buf[:1]); err != nil {
+			return
+		}
+		pLen := int(buf[0])
+		if _, err := io.ReadFull(clientConn, buf[:pLen]); err != nil {
+			return
+		}
+		password := string(buf[:pLen])
+
+		var ok bool
+		user, ok = s.userMgr.Authenticate(username, password)
+		if !ok {
+			clientConn.Write([]byte{0x01, 0x01})
+			log.Printf("[ssh-proxy] conn#%d: auth failed user=%q ip=%s", connID, username, clientIP)
+			return
+		}
+		clientConn.Write([]byte{0x01, 0x00})
+
+		if reason := user.CheckConnect(clientIP); reason != "" {
+			log.Printf("[ssh-proxy] conn#%d: user %q denied: %s", connID, username, reason)
+			io.ReadFull(clientConn, buf[:4])
+			clientConn.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+
+		user.MarkConnect(clientIP)
+		defer user.MarkDisconnect(clientIP)
+	} else {
+		clientConn.Write([]byte{0x05, 0x00})
+	}
+
+	// ──── SOCKS5 CONNECT ────
 	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
 		return
 	}
@@ -252,18 +311,27 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
+	// Relay with rate limiting
 	var txN, rxN int64
 	done := make(chan struct{}, 2)
 	go func() {
+		var src io.Reader = clientConn
+		if user != nil {
+			src = user.WrapReader(src)
+		}
 		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(upstreamConn, clientConn, *bufPtr)
+		n, _ := io.CopyBuffer(upstreamConn, src, *bufPtr)
 		s.bufPool.Put(bufPtr)
 		txN = n
 		done <- struct{}{}
 	}()
 	go func() {
+		var dst io.Writer = clientConn
+		if user != nil {
+			dst = user.WrapWriter(dst)
+		}
 		bufPtr := s.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(clientConn, upstreamConn, *bufPtr)
+		n, _ := io.CopyBuffer(dst, upstreamConn, *bufPtr)
 		s.bufPool.Put(bufPtr)
 		rxN = n
 		done <- struct{}{}
@@ -272,7 +340,6 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 	<-done
 	<-done
 
-	// Track bandwidth per instance
 	inst.AddTx(txN)
 	inst.AddRx(rxN)
 }
