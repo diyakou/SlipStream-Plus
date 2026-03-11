@@ -1,0 +1,46 @@
+name: Build Linux Binaries
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/slipstreamplus-linux-${{ matrix.arch }}" ./cmd/slipstreamplus
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slipstreamplus-linux-${{ matrix.arch }}
+          path: dist/slipstreamplus-linux-${{ matrix.arch }}

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"math"
+	"math/rand"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
@@ -17,19 +18,24 @@ func (ll *LeastLoad) Pick(instances []*engine.Instance) *engine.Instance {
 		return nil
 	}
 
-	var best *engine.Instance
 	bestLoad := int64(math.MaxInt64)
+	best := make([]*engine.Instance, 0, len(instances))
 
 	for _, inst := range instances {
 		load := inst.ActiveConns()
 		if load < bestLoad {
 			bestLoad = load
-			best = inst
+			best = best[:0]
+			best = append(best, inst)
+			continue
+		}
+		if load == bestLoad {
+			best = append(best, inst)
 		}
 	}
 
-	if best == nil {
+	if len(best) == 0 {
 		return instances[0]
 	}
-	return best
+	return best[rand.Intn(len(best))]
 }

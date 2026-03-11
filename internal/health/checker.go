@@ -20,6 +20,8 @@ import (
 //
 // Latency is only set from successful tunnel probes (real RTT).
 const maxConsecutiveFailures = 3
+const minTunnelTimeout = 5 * time.Second
+const maxParallelChecks = 32
 
 type Checker struct {
 	manager  *engine.Manager
@@ -36,8 +38,8 @@ func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	timeout := cfg.TimeoutDuration()
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
+	if timeout < minTunnelTimeout {
+		timeout = minTunnelTimeout
 	}
 
 	return &Checker{
@@ -84,13 +86,32 @@ func (c *Checker) run() {
 
 func (c *Checker) checkAll() {
 	instances := c.manager.AllInstances()
+	parallel := maxParallelChecks
+	if len(instances) < parallel {
+		parallel = len(instances)
+	}
+	if parallel <= 0 {
+		return
+	}
+
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+
 	for _, inst := range instances {
 		if inst.State() == engine.StateDead {
 			inst.SetLastPingMs(-1)
 			continue
 		}
-		go c.checkOne(inst)
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(inst *engine.Instance) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			c.checkOne(inst)
+		}(inst)
 	}
+	wg.Wait()
 }
 
 func (c *Checker) recordSuccess(id int) {

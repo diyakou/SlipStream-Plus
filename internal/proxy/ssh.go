@@ -285,22 +285,42 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 		return
 	}
 
-	inst := s.balancer.Pick(sshHealthy)
-	if inst == nil {
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+	candidates := append([]*engine.Instance(nil), sshHealthy...)
+	var inst *engine.Instance
+	var upstreamConn net.Conn
+	var lastErr error
+
+	for len(candidates) > 0 {
+		inst = s.balancer.Pick(candidates)
+		if inst == nil {
+			break
+		}
+
+		sshClient, err := s.getSSHClient(inst)
+		if err != nil {
+			lastErr = err
+			log.Printf("[ssh-proxy] conn#%d: SSH connect failed on instance %d: %v", connID, inst.ID(), err)
+			candidates = removeInstanceByID(candidates, inst.ID())
+			inst = nil
+			continue
+		}
+
+		upstreamConn, err = sshClient.Dial("tcp", target)
+		if err != nil {
+			lastErr = err
+			log.Printf("[ssh-proxy] conn#%d: SSH dial %s failed on instance %d: %v", connID, target, inst.ID(), err)
+			s.dropSSHClient(inst.ID())
+			candidates = removeInstanceByID(candidates, inst.ID())
+			inst = nil
+			continue
+		}
+		break
 	}
 
-	sshClient, err := s.getSSHClient(inst)
-	if err != nil {
-		log.Printf("[ssh-proxy] conn#%d: SSH connect failed on instance %d: %v", connID, inst.ID(), err)
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	upstreamConn, err := sshClient.Dial("tcp", target)
-	if err != nil {
-		log.Printf("[ssh-proxy] conn#%d: SSH dial %s failed: %v", connID, target, err)
+	if upstreamConn == nil || inst == nil {
+		if lastErr != nil {
+			log.Printf("[ssh-proxy] conn#%d: all instances failed: %v", connID, lastErr)
+		}
 		clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -344,6 +364,14 @@ func (s *SSHServer) handleConnection(clientConn net.Conn, connID uint64) {
 	inst.AddRx(rxN)
 }
 
+func (s *SSHServer) dropSSHClient(id int) {
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
+	if c, ok := s.sshClients[id]; ok {
+		c.Close()
+		delete(s.sshClients, id)
+	}
+}
 func (s *SSHServer) Close() {
 	s.sshMu.Lock()
 	defer s.sshMu.Unlock()

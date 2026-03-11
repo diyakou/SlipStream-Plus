@@ -7,33 +7,36 @@ import (
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
-type LeastPing struct{}
+// Adaptive prefers low-load instances and uses latency as a secondary signal.
+type Adaptive struct{}
 
-func NewLeastPing() *LeastPing {
-	return &LeastPing{}
+func NewAdaptive() *Adaptive {
+	return &Adaptive{}
 }
 
-func (lp *LeastPing) Pick(instances []*engine.Instance) *engine.Instance {
+func (a *Adaptive) Pick(instances []*engine.Instance) *engine.Instance {
 	if len(instances) == 0 {
 		return nil
 	}
 
-	bestPing := int64(math.MaxInt64)
+	bestScore := int64(math.MaxInt64)
 	best := make([]*engine.Instance, 0, len(instances))
 
 	for _, inst := range instances {
 		ping := inst.LastPingMs()
 		if ping <= 0 {
-			// No ping data yet, treat as high latency
-			ping = math.MaxInt64 - 1
+			ping = 5000
 		}
-		if ping < bestPing {
-			bestPing = ping
+
+		// Load is weighted higher so hot instances are avoided quickly.
+		score := inst.ActiveConns()*1000 + ping
+		if score < bestScore {
+			bestScore = score
 			best = best[:0]
 			best = append(best, inst)
 			continue
 		}
-		if ping == bestPing {
+		if score == bestScore {
 			best = append(best, inst)
 		}
 	}

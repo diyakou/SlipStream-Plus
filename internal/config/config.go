@@ -251,11 +251,11 @@ func (c *Config) Validate() error {
 	}
 
 	switch c.Strategy {
-	case "round_robin", "random", "least_ping", "least_load":
+	case "round_robin", "random", "least_ping", "least_load", "adaptive":
 	case "":
 		c.Strategy = "round_robin"
 	default:
-		return fmt.Errorf("invalid strategy: %s (valid: round_robin, random, least_ping, least_load)", c.Strategy)
+		return fmt.Errorf("invalid strategy: %s (valid: round_robin, random, least_ping, least_load, adaptive)", c.Strategy)
 	}
 
 	if c.Socks.BufferSize <= 0 {

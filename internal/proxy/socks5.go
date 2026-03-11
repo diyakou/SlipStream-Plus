@@ -222,69 +222,35 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		return
 	}
 
-	inst := s.balancer.Pick(socksHealthy)
-	if inst == nil {
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+	candidates := append([]*engine.Instance(nil), socksHealthy...)
+	var inst *engine.Instance
+	var upstreamConn net.Conn
+	var lastErr error
+
+	for len(candidates) > 0 {
+		inst = s.balancer.Pick(candidates)
+		if inst == nil {
+			break
+		}
+
+		upstreamConn, lastErr = s.connectThroughInstance(inst, atyp, addrBytes, portBytes)
+		if lastErr == nil {
+			break
+		}
+
+		log.Printf("[proxy] conn#%d: instance %d failed, trying next: %v", connID, inst.ID(), lastErr)
+		candidates = removeInstanceByID(candidates, inst.ID())
+		inst = nil
 	}
 
-	upstreamConn, err := inst.Dial()
-	if err != nil {
-		log.Printf("[proxy] conn#%d: dial instance %d failed: %v", connID, inst.ID(), err)
+	if upstreamConn == nil || inst == nil {
+		if lastErr != nil {
+			log.Printf("[proxy] conn#%d: all instances failed: %v", connID, lastErr)
+		}
 		clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer upstreamConn.Close()
-
-	if tc, ok := upstreamConn.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-		tc.SetNoDelay(true)
-	}
-
-	// ──── SOCKS5 negotiation with upstream ────
-	// Greeting: no auth
-	upstreamConn.Write([]byte{0x05, 0x01, 0x00})
-	greetResp := make([]byte, 2)
-	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	// CONNECT: replay the same target address
-	connectReq := make([]byte, 0, 4+len(addrBytes)+2)
-	connectReq = append(connectReq, 0x05, 0x01, 0x00, atyp)
-	connectReq = append(connectReq, addrBytes...)
-	connectReq = append(connectReq, portBytes...)
-	upstreamConn.Write(connectReq)
-
-	// Read upstream CONNECT reply (at least 4 bytes header)
-	connectResp := make([]byte, 4)
-	if _, err := io.ReadFull(upstreamConn, connectResp); err != nil {
-		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	// Read the rest of the reply (bind addr + port)
-	repAtyp := connectResp[3]
-	switch repAtyp {
-	case 0x01:
-		io.ReadFull(upstreamConn, make([]byte, 4+2)) // IPv4 + port
-	case 0x03:
-		lenBuf := make([]byte, 1)
-		io.ReadFull(upstreamConn, lenBuf)
-		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
-	case 0x04:
-		io.ReadFull(upstreamConn, make([]byte, 16+2)) // IPv6 + port
-	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2)) // fallback
-	}
-
-	if connectResp[1] != 0x00 {
-		// Upstream refused
-		clientConn.Write([]byte{0x05, connectResp[1], 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
 
 	// ──── Success! Tell client and start relay ────
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -298,6 +264,79 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	s.relay(clientConn, upstreamConn, inst, user, connID)
 }
 
+func (s *Server) connectThroughInstance(inst *engine.Instance, atyp byte, addrBytes, portBytes []byte) (net.Conn, error) {
+	upstreamConn, err := inst.Dial()
+	if err != nil {
+		return nil, err
+	}
+
+	if tc, ok := upstreamConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetNoDelay(true)
+	}
+
+	if _, err := upstreamConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream greeting write: %w", err)
+	}
+
+	greetResp := make([]byte, 2)
+	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream greeting read: %w", err)
+	}
+	if greetResp[0] != 0x05 || greetResp[1] == 0xFF {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream greeting invalid: %v", greetResp)
+	}
+
+	connectReq := make([]byte, 0, 4+len(addrBytes)+2)
+	connectReq = append(connectReq, 0x05, 0x01, 0x00, atyp)
+	connectReq = append(connectReq, addrBytes...)
+	connectReq = append(connectReq, portBytes...)
+	if _, err := upstreamConn.Write(connectReq); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream connect write: %w", err)
+	}
+
+	connectResp := make([]byte, 4)
+	if _, err := io.ReadFull(upstreamConn, connectResp); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream connect header: %w", err)
+	}
+	if err := discardSocksReplyAddress(upstreamConn, connectResp[3]); err != nil {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream connect payload: %w", err)
+	}
+	if connectResp[1] != 0x00 {
+		upstreamConn.Close()
+		return nil, fmt.Errorf("upstream refused with code %d", connectResp[1])
+	}
+
+	return upstreamConn, nil
+}
+
+func discardSocksReplyAddress(conn net.Conn, atyp byte) error {
+	switch atyp {
+	case 0x01:
+		_, err := io.ReadFull(conn, make([]byte, 4+2))
+		return err
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return err
+		}
+		_, err := io.ReadFull(conn, make([]byte, int(lenBuf[0])+2))
+		return err
+	case 0x04:
+		_, err := io.ReadFull(conn, make([]byte, 16+2))
+		return err
+	default:
+		_, err := io.ReadFull(conn, make([]byte, 4+2))
+		return err
+	}
+}
 func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
 	var clientToUpstream, upstreamToClient int64
 	done := make(chan struct{}, 2)

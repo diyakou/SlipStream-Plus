@@ -20,6 +20,8 @@ func New(strategy string) Balancer {
 		return NewLeastPing()
 	case "least_load":
 		return NewLeastLoad()
+	case "adaptive":
+		return NewAdaptive()
 	default:
 		return NewRoundRobin()
 	}
