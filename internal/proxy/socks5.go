@@ -88,6 +88,8 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
+		tc.SetReadBuffer(s.bufferSize)
+		tc.SetWriteBuffer(s.bufferSize)
 	}
 
 	clientIP := users.ExtractIP(clientConn.RemoteAddr())
@@ -165,18 +167,19 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		clientConn.Write([]byte{0x05, 0x00})
 	}
 
-	// ──── SOCKS5 CONNECT Request ────
+	// ──── SOCKS5 CONNECT/UDP ASSOCIATE Request ────
 	// Read: VER(1) CMD(1) RSV(1) ATYP(1) + ADDR + PORT(2)
 	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
 		return
 	}
-	if buf[1] != 0x01 { // only CONNECT supported
+	cmd := buf[1]
+	if cmd != 0x01 && cmd != 0x03 { // only CONNECT + UDP ASSOCIATE supported
 		clientConn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	atyp := buf[3]
 
-	// Capture target address raw bytes for replaying to upstream
+	// Capture target address raw bytes for replaying to upstream (or drain for UDP ASSOCIATE)
 	var addrBytes []byte
 	switch atyp {
 	case 0x01: // IPv4
@@ -206,6 +209,11 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 
 	portBytes := make([]byte, 2)
 	if _, err := io.ReadFull(clientConn, portBytes); err != nil {
+		return
+	}
+
+	if cmd == 0x03 {
+		s.handleUDPAssociate(clientConn, inst, user, connID)
 		return
 	}
 
@@ -240,6 +248,8 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 		tc.SetNoDelay(true)
+		tc.SetReadBuffer(s.bufferSize)
+		tc.SetWriteBuffer(s.bufferSize)
 	}
 
 	// ──── Pipelined SOCKS5 negotiation with upstream ────
@@ -294,6 +304,158 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	log.Printf("[proxy] conn#%d: connected via instance %d, port %d", connID, inst.ID(), port)
 
 	s.relay(clientConn, upstreamConn, inst, user, connID)
+}
+
+func (s *Server) handleUDPAssociate(clientConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
+	// Create a local UDP socket for the client to send datagrams to.
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer udpConn.Close()
+
+	// Reply with the local bind address so the client knows where to send UDP.
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	reply := make([]byte, 10)
+	reply[0] = 0x05
+	reply[1] = 0x00
+	reply[2] = 0x00
+	reply[3] = 0x01
+	copy(reply[4:8], localAddr.IP.To4())
+	binary.BigEndian.PutUint16(reply[8:], uint16(localAddr.Port))
+	clientConn.Write(reply)
+
+	// Establish SOCKS5 UDP ASSOCIATE with upstream instance.
+	upstreamConn, err := inst.Dial()
+	if err != nil {
+		log.Printf("[proxy] conn#%d: dial instance %d failed: %v", connID, inst.ID(), err)
+		return
+	}
+	defer upstreamConn.Close()
+
+	if tc, ok := upstreamConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetNoDelay(true)
+		tc.SetReadBuffer(s.bufferSize)
+		tc.SetWriteBuffer(s.bufferSize)
+	}
+
+	// Request UDP ASSOCIATE from upstream.
+	if _, err := upstreamConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		log.Printf("[proxy] conn#%d: upstream udp associate write failed: %v", connID, err)
+		return
+	}
+
+	resp := make([]byte, 6)
+	if _, err := io.ReadFull(upstreamConn, resp); err != nil {
+		log.Printf("[proxy] conn#%d: upstream udp associate read failed: %v", connID, err)
+		return
+	}
+	if resp[1] != 0x00 {
+		log.Printf("[proxy] conn#%d: upstream udp associate failed: %d", connID, resp[1])
+		return
+	}
+
+	// Determine upstream UDP relay address
+	repAtyp := resp[5]
+	var upAddr *net.UDPAddr
+	switch repAtyp {
+	case 0x01:
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(upstreamConn, addr); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp addr failed: %v", connID, err)
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(upstreamConn, portBuf); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp port failed: %v", connID, err)
+			return
+		}
+		upAddr = &net.UDPAddr{IP: net.IP(addr), Port: int(binary.BigEndian.Uint16(portBuf))}
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(upstreamConn, lenBuf); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp domain len failed: %v", connID, err)
+			return
+		}
+		domLen := int(lenBuf[0])
+		dom := make([]byte, domLen)
+		if _, err := io.ReadFull(upstreamConn, dom); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp domain failed: %v", connID, err)
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(upstreamConn, portBuf); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp port failed: %v", connID, err)
+			return
+		}
+		upAddr = &net.UDPAddr{IP: net.ParseIP(string(dom)), Port: int(binary.BigEndian.Uint16(portBuf))}
+	case 0x04:
+		addr := make([]byte, 16)
+		if _, err := io.ReadFull(upstreamConn, addr); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp addr failed: %v", connID, err)
+			return
+		}
+		portBuf := make([]byte, 2)
+		if _, err := io.ReadFull(upstreamConn, portBuf); err != nil {
+			log.Printf("[proxy] conn#%d: read upstream udp port failed: %v", connID, err)
+			return
+		}
+		upAddr = &net.UDPAddr{IP: net.IP(addr), Port: int(binary.BigEndian.Uint16(portBuf))}
+	default:
+		log.Printf("[proxy] conn#%d: upstream udp associate returned unknown atyp %d", connID, repAtyp)
+		return
+	}
+
+	upstreamUDP, err := net.DialUDP("udp", nil, upAddr)
+	if err != nil {
+		log.Printf("[proxy] conn#%d: dial upstream udp %s failed: %v", connID, upAddr, err)
+		return
+	}
+	defer upstreamUDP.Close()
+
+	inst.IncrConns()
+	defer inst.DecrConns()
+
+	// Relay UDP datagrams between client and upstream.
+	done := make(chan struct{}, 2)
+	var clientAddr *net.UDPAddr
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				break
+			}
+			if clientAddr == nil {
+				clientAddr = addr
+			}
+			if _, err := upstreamUDP.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, err := upstreamUDP.Read(buf)
+			if err != nil {
+				break
+			}
+			if clientAddr != nil {
+				udpConn.WriteToUDP(buf[:n], clientAddr)
+			}
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
 }
 
 func (s *Server) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
