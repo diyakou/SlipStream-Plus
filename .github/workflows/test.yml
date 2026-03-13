@@ -8,8 +8,19 @@ on:
 
 jobs:
   test:
-    name: Run Tests
+    name: Run Tests (${{ matrix.goos }}-${{ matrix.goarch }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -23,14 +34,8 @@ jobs:
       - name: Verify formatting
         run: go fmt ./...
 
-      - name: Build without embed (Linux)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v ./cmd/slipstreamplus
+      - name: Build without embed
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/slipstreamplus
 
-      - name: Build without embed (Windows)
-        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -v ./cmd/slipstreamplus
-
-      - name: Build with embed (Linux)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
-
-      - name: Build with embed (Windows)
-        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags embed_slipstream -v ./cmd/slipstreamplus
+      - name: Build with embed
+        run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -tags embed_slipstream -v ./cmd/slipstreamplus
