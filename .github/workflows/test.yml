@@ -38,4 +38,5 @@ jobs:
         run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v ./cmd/slipstreamplus
 
       - name: Build with embed
+        if: matrix.goarch == 'amd64'
         run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -tags embed_slipstream -v ./cmd/slipstreamplus

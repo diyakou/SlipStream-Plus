@@ -40,7 +40,11 @@ jobs:
 
       - name: Build Binary
         run: |
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -tags embed_slipstream -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/slipstreamplus
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -tags embed_slipstream -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/slipstreamplus
+          else
+            CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/slipstreamplus
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
