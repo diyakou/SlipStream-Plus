@@ -130,23 +130,7 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		return
 	}
 
-	// Read SOCKS5 response header (4 bytes: VER + REP + RSV + ATYP)
-	respHeader := make([]byte, 4)
-	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
-		log.Printf("[proxy-http] conn#%d: read response header failed: %v", connID, err)
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	// Skip SOCKS5 greeting response (2 bytes) before CONNECT response
-	// Wait, we need to read greeting response first!
-	// Actually, let me re-read the proper SOCKS5 flow...
-	// After we send greeting + CONNECT pipelined, we get:
-	// - Greeting response (2 bytes: VER + METHOD)
-	// - CONNECT response (4+ bytes: VER + REP + RSV + ATYP + ADDR + PORT)
-	// So respHeader is actually the second response? No wait...
-	
-	// Let me fix this properly - read greeting response first
+	// Read SOCKS5 greeting response (2 bytes)
 	greetResp := make([]byte, 2)
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
@@ -154,8 +138,8 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		return
 	}
 
-	// Now read CONNECT response header
-	respHeader = make([]byte, 4)
+	// Now read CONNECT response header (4 bytes: VER + REP + RSV + ATYP)
+	respHeader := make([]byte, 4)
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
@@ -256,86 +240,6 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	}
 
 	// Drain bind address + port
-	atyp := respHeader[3]
-	switch atyp {
-	case 0x01: // IPv4
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
-	case 0x03: // Domain
-		lenBuf := make([]byte, 1)
-		io.ReadFull(upstreamConn, lenBuf)
-		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
-	case 0x04: // IPv6
-		io.ReadFull(upstreamConn, make([]byte, 16+2))
-	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
-	}
-
-	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
-	h.relay(clientConn, upstreamConn, connID)
-}
-		clientConn.Write([]byte("HTTP/1.0 400 Bad Request\r\n\r\n"))
-		return
-	}
-
-	targetHost := req.URL.Host
-	if req.URL.Port() == "" {
-		if req.URL.Scheme == "https" {
-			targetHost = req.URL.Host + ":443"
-		} else {
-			targetHost = req.URL.Host + ":80"
-		}
-	}
-
-	// Pick upstream instance
-	healthy := h.manager.HealthyInstances()
-	socksHealthy := make([]*engine.Instance, 0, len(healthy))
-	for _, inst := range healthy {
-		if inst.Config.Mode != "ssh" {
-			socksHealthy = append(socksHealthy, inst)
-		}
-	}
-	if len(socksHealthy) == 0 {
-		clientConn.Write([]byte("HTTP/1.0 503 Service Unavailable\r\n\r\n"))
-		return
-	}
-
-	inst := h.balancer.Pick(socksHealthy)
-	if inst == nil {
-		clientConn.Write([]byte("HTTP/1.0 503 Service Unavailable\r\n\r\n"))
-		return
-	}
-
-	upstreamConn, err := inst.Dial()
-	if err != nil {
-		log.Printf("[proxy-http] conn#%d: dial instance %d failed: %v", connID, inst.ID(), err)
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-	defer upstreamConn.Close()
-
-	// Send SOCKS5 request
-	socksReq := h.buildSOCKS5Connect(targetHost)
-	if _, err := upstreamConn.Write(socksReq); err != nil {
-		log.Printf("[proxy-http] conn#%d: write to upstream failed: %v", connID, err)
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	// Read SOCKS5 response header (4 bytes)
-	respHeader := make([]byte, 4)
-	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
-		log.Printf("[proxy-http] conn#%d: read response header failed: %v", connID, err)
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	if respHeader[1] != 0x00 {
-		log.Printf("[proxy-http] conn#%d: SOCKS5 connect failed: %d", connID, respHeader[1])
-		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	// Drain bind address + port based on ATYP
 	atyp := respHeader[3]
 	switch atyp {
 	case 0x01: // IPv4

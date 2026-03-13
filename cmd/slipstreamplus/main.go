@@ -223,3 +223,4 @@ func deriveUDPAddr(socksAddr string) string {
 	// Use SOCKS port + 1 for UDP relay
 	udpPort := socksPort + 1
 	return net.JoinHostPort(host, fmt.Sprintf("%d", udpPort))
+}
