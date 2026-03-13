@@ -283,15 +283,6 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s successful", connID, targetHost, h.socksAddr)
 	h.relay(clientConn, upstreamConn, connID)
 }
-	case 0x04: // IPv6
-		io.ReadFull(upstreamConn, make([]byte, 16+2))
-	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
-	}
-
-	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
-	h.relay(clientConn, upstreamConn, connID)
-}
 
 // buildSOCKS5Connect builds SOCKS5 CONNECT request for target
 // Returns: VER(1) CMD(1) RSV(1) ATYP(1) ADDR PORT
