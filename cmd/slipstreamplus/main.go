@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -112,7 +114,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start proxy
+	// Start proxy servers (SOCKS5 + HTTP CONNECT)
+	httpAddr := deriveHTTPAddr(cfg.Socks.Listen)
+	log.Printf("HTTP CONNECT proxy will listen on: %s", httpAddr)
+
 	if hasSSH && !hasSOCKS {
 		log.Printf("Starting in SSH mode (SOCKS5 → SSH tunnel → slipstream)")
 		sshServer := proxy.NewSSHServer(
@@ -124,16 +129,42 @@ func main() {
 			log.Fatalf("SSH proxy error: %v", err)
 		}
 	} else if !hasSSH && hasSOCKS {
-		log.Printf("Starting in SOCKS mode (SOCKS5 → slipstream)")
-		proxyServer := proxy.NewServer(
+		log.Printf("Starting in SOCKS+HTTP mode (SOCKS5 & HTTP CONNECT → slipstream)")
+		
+		// Start HTTP CONNECT proxy in background
+		httpServer := proxy.NewHTTPServer(
+			httpAddr, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
+			mgr, bal, userMgr,
+		)
+		go func() {
+			if err := httpServer.ListenAndServe(); err != nil {
+				log.Fatalf("HTTP proxy error: %v", err)
+			}
+		}()
+
+		// Start SOCKS5 proxy in foreground
+		socksServer := proxy.NewServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
 			mgr, bal, userMgr,
 		)
-		if err := proxyServer.ListenAndServe(); err != nil {
-			log.Fatalf("Proxy error: %v", err)
+		if err := socksServer.ListenAndServe(); err != nil {
+			log.Fatalf("SOCKS proxy error: %v", err)
 		}
 	} else if hasSSH && hasSOCKS {
-		log.Printf("Starting in MIXED mode (SSH + SOCKS instances)")
+		log.Printf("Starting in MIXED mode (SSH + SOCKS instances with HTTP CONNECT)")
+		
+		// Start HTTP CONNECT proxy in background
+		httpServer := proxy.NewHTTPServer(
+			httpAddr, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
+			mgr, bal, userMgr,
+		)
+		go func() {
+			if err := httpServer.ListenAndServe(); err != nil {
+				log.Fatalf("HTTP proxy error: %v", err)
+			}
+		}()
+
+		// Start SSH proxy in foreground
 		sshServer := proxy.NewSSHServer(
 			cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
 			mgr, bal, userMgr,
@@ -143,4 +174,19 @@ func main() {
 			log.Fatalf("SSH proxy error: %v", err)
 		}
 	}
+}
+
+// deriveHTTPAddr derives HTTP proxy address from SOCKS address
+// e.g., "127.0.0.1:1080" → "127.0.0.1:8080"
+func deriveHTTPAddr(socksAddr string) string {
+	host, port, err := net.SplitHostPort(socksAddr)
+	if err != nil {
+		// Default to localhost
+		return "127.0.0.1:8080"
+	}
+	var socksPort int
+	fmt.Sscanf(port, "%d", &socksPort)
+	// Use 8080 for HTTP proxy (standard)
+	return net.JoinHostPort(host, "8080")
+}
 }
