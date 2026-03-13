@@ -76,17 +76,18 @@ type HealthCheckConfig struct {
 }
 
 type InstanceConfig struct {
-	Domain        string          `json:"domain"`
-	Resolver      string          `json:"resolver"`
-	Port          json.RawMessage `json:"port"`
-	Replicas      int             `json:"replicas,omitempty"`
-	Mode          string          `json:"mode,omitempty"`
-	Authoritative bool            `json:"authoritative"`
-	Cert          string          `json:"cert,omitempty"`
-	SSHPort       int             `json:"ssh_port,omitempty"`
-	SSHUser       string          `json:"ssh_user,omitempty"`
-	SSHPassword   string          `json:"ssh_password,omitempty"`
-	SSHKey        string          `json:"ssh_key,omitempty"`
+	Domain         string          `json:"domain"`
+	Resolver       string          `json:"resolver"`
+	Port           json.RawMessage `json:"port"`
+	Replicas       int             `json:"replicas,omitempty"`
+	Mode           string          `json:"mode,omitempty"`
+	Authoritative  bool            `json:"authoritative"`
+	Cert           string          `json:"cert,omitempty"`
+	SSHPort        int             `json:"ssh_port,omitempty"`
+	SSHUser        string          `json:"ssh_user,omitempty"`
+	SSHPassword    string          `json:"ssh_password,omitempty"`
+	SSHKey         string          `json:"ssh_key,omitempty"`
+	SlipstreamArgs []string        `json:"slipstream_args,omitempty"`
 }
 
 func (ic *InstanceConfig) ParsePorts() ([]int, error) {
