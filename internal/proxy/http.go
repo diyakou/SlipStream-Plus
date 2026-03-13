@@ -122,23 +122,36 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		tc.SetWriteBuffer(h.bufferSize)
 	}
 
-	// SOCKS5 greeting + CONNECT request (pipelined)
-	socksReq := h.buildSOCKS5Connect(targetHost)
-	if _, err := upstreamConn.Write(socksReq); err != nil {
-		log.Printf("[proxy-http] conn#%d: write to SOCKS5 failed: %v", connID, err)
+	// Step 1: Send SOCKS5 greeting
+	greetReq := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+	if _, err := upstreamConn.Write(greetReq); err != nil {
+		log.Printf("[proxy-http] conn#%d: write greeting to SOCKS5 failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// Read SOCKS5 greeting response (2 bytes)
+	// Step 2: Read greeting response (2 bytes)
 	greetResp := make([]byte, 2)
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	if greetResp[0] != 0x05 || greetResp[1] != 0x00 {
+		log.Printf("[proxy-http] conn#%d: SOCKS5 greeting failed: %x %x", connID, greetResp[0], greetResp[1])
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
 
-	// Now read CONNECT response header (4 bytes: VER + REP + RSV + ATYP)
+	// Step 3: Send CONNECT request to SOCKS5
+	connectReq := h.buildSOCKS5Connect(targetHost)
+	if _, err := upstreamConn.Write(connectReq); err != nil {
+		log.Printf("[proxy-http] conn#%d: write CONNECT to SOCKS5 failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Step 4: Read CONNECT response header (4 bytes: VER + REP + RSV + ATYP)
 	respHeader := make([]byte, 4)
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
@@ -147,12 +160,12 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	}
 
 	if respHeader[1] != 0x00 {
-		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed: %d", connID, respHeader[1])
+		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed with status: %d", connID, respHeader[1])
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// Drain bind address + port based on ATYP
+	// Step 5: Drain bind address + port based on ATYP
 	atyp := respHeader[3]
 	switch atyp {
 	case 0x01: // IPv4
@@ -170,7 +183,7 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	// Success! Send HTTP 200 to client
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	log.Printf("[proxy-http] conn#%d: CONNECT %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
+	log.Printf("[proxy-http] conn#%d: CONNECT %s via SOCKS5 %s successful", connID, targetHost, h.socksAddr)
 
 	// Relay data between client and upstream SOCKS5
 	h.relay(clientConn, upstreamConn, connID)
@@ -209,23 +222,36 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 		tc.SetWriteBuffer(h.bufferSize)
 	}
 
-	// Send SOCKS5 CONNECT request
-	socksReq := h.buildSOCKS5Connect(targetHost)
-	if _, err := upstreamConn.Write(socksReq); err != nil {
-		log.Printf("[proxy-http] conn#%d: write to SOCKS5 failed: %v", connID, err)
+	// Step 1: Send SOCKS5 greeting
+	greetReq := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+	if _, err := upstreamConn.Write(greetReq); err != nil {
+		log.Printf("[proxy-http] conn#%d: write greeting to SOCKS5 failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// Read SOCKS5 greeting response
+	// Step 2: Read greeting response (2 bytes)
 	greetResp := make([]byte, 2)
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	if greetResp[0] != 0x05 || greetResp[1] != 0x00 {
+		log.Printf("[proxy-http] conn#%d: SOCKS5 greeting failed: %x %x", connID, greetResp[0], greetResp[1])
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
 
-	// Read CONNECT response header
+	// Step 3: Send SOCKS5 CONNECT request
+	socksReq := h.buildSOCKS5Connect(targetHost)
+	if _, err := upstreamConn.Write(socksReq); err != nil {
+		log.Printf("[proxy-http] conn#%d: write CONNECT to SOCKS5 failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Step 4: Read CONNECT response header
 	respHeader := make([]byte, 4)
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
@@ -234,12 +260,12 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	}
 
 	if respHeader[1] != 0x00 {
-		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed: %d", connID, respHeader[1])
+		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed with status: %d", connID, respHeader[1])
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// Drain bind address + port
+	// Step 5: Drain bind address + port
 	atyp := respHeader[3]
 	switch atyp {
 	case 0x01: // IPv4
@@ -254,12 +280,21 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 		io.ReadFull(upstreamConn, make([]byte, 4+2))
 	}
 
+	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s successful", connID, targetHost, h.socksAddr)
+	h.relay(clientConn, upstreamConn, connID)
+}
+	case 0x04: // IPv6
+		io.ReadFull(upstreamConn, make([]byte, 16+2))
+	default:
+		io.ReadFull(upstreamConn, make([]byte, 4+2))
+	}
+
 	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
 	h.relay(clientConn, upstreamConn, connID)
 }
 
-// buildSOCKS5Connect builds SOCKS5 greeting + CONNECT request for target
-// Returns: VER(1) NMETHODS(1) METHOD(1) + VER(1) CMD(1) RSV(1) ATYP(1) ADDR PORT
+// buildSOCKS5Connect builds SOCKS5 CONNECT request for target
+// Returns: VER(1) CMD(1) RSV(1) ATYP(1) ADDR PORT
 func (h *HTTPServer) buildSOCKS5Connect(targetHostPort string) []byte {
 	// Parse host and port
 	host, port, err := net.SplitHostPort(targetHostPort)
@@ -272,11 +307,8 @@ func (h *HTTPServer) buildSOCKS5Connect(targetHostPort string) []byte {
 	var portNum uint16
 	fmt.Sscanf(port, "%d", &portNum)
 
-	// SOCKS5 greeting
-	req := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
-
 	// SOCKS5 CONNECT request
-	req = append(req, 0x05, 0x01, 0x00) // VER=5, CMD=1 (CONNECT), RSV=0
+	req := []byte{0x05, 0x01, 0x00} // VER=5, CMD=1 (CONNECT), RSV=0
 
 	// Try parsing as IPv4
 	if ip := net.ParseIP(host); ip != nil {
