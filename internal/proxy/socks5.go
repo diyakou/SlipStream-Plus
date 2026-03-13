@@ -212,11 +212,6 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 		return
 	}
 
-	if cmd == 0x03 {
-		s.handleUDPAssociate(clientConn, inst, user, connID)
-		return
-	}
-
 	// ──── Pick upstream slipstream instance ────
 	healthy := s.manager.HealthyInstances()
 	socksHealthy := make([]*engine.Instance, 0, len(healthy))
@@ -233,6 +228,11 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	inst := s.balancer.Pick(socksHealthy)
 	if inst == nil {
 		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	if cmd == 0x03 {
+		s.handleUDPAssociate(clientConn, inst, user, connID)
 		return
 	}
 
