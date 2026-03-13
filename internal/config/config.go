@@ -12,6 +12,7 @@ import (
 type Config struct {
 	Socks            SocksConfig       `json:"socks"`
 	SlipstreamBinary string            `json:"slipstream_binary,omitempty"`
+	SlipstreamArgs   []string          `json:"slipstream_args,omitempty"`
 	Strategy         string            `json:"strategy"`
 	HealthCheck      HealthCheckConfig `json:"health_check"`
 	Instances        []InstanceConfig  `json:"instances"`
@@ -145,6 +146,7 @@ type ExpandedInstance struct {
 	SSHUser       string
 	SSHPassword   string
 	SSHKey        string
+	SlipstreamArgs []string
 	OriginalIndex int
 	ReplicaIndex  int
 }
@@ -184,18 +186,19 @@ func (c *Config) ExpandInstances() ([]ExpandedInstance, error) {
 
 		for r := 0; r < replicas; r++ {
 			result = append(result, ExpandedInstance{
-				Domain:        inst.Domain,
-				Resolver:      inst.Resolver,
-				Port:          ports[r],
-				Mode:          mode,
-				Authoritative: inst.Authoritative,
-				Cert:          inst.Cert,
-				SSHPort:       inst.SSHPort,
-				SSHUser:       inst.SSHUser,
-				SSHPassword:   inst.SSHPassword,
-				SSHKey:        inst.SSHKey,
-				OriginalIndex: i,
-				ReplicaIndex:  r,
+				Domain:         inst.Domain,
+				Resolver:       inst.Resolver,
+				Port:           ports[r],
+				Mode:           mode,
+				Authoritative:  inst.Authoritative,
+				Cert:           inst.Cert,
+				SSHPort:        inst.SSHPort,
+				SSHUser:        inst.SSHUser,
+				SSHPassword:    inst.SSHPassword,
+				SSHKey:         inst.SSHKey,
+				SlipstreamArgs: inst.SlipstreamArgs,
+				OriginalIndex:  i,
+				ReplicaIndex:   r,
 			})
 		}
 	}

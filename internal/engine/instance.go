@@ -119,6 +119,12 @@ func (inst *Instance) Start() error {
 		args = append(args, "--cert", inst.Config.Cert)
 	}
 
+	// Allow passing additional slipstream client arguments from config.
+	// This can be used to enable options like compression, EDNS, etc.
+	if len(inst.Config.SlipstreamArgs) > 0 {
+		args = append(args, inst.Config.SlipstreamArgs...)
+	}
+
 	cmd := exec.Command(inst.Binary, args...)
 	cmd.SysProcAttr = procAttr()
 
