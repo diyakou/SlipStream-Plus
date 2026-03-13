@@ -11,34 +11,25 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/ParsaKSH/SlipStream-Plus/internal/balancer"
-	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
-	"github.com/ParsaKSH/SlipStream-Plus/internal/users"
 )
 
-// HTTPServer is an HTTP CONNECT proxy that forwards connections to slipstream instances.
+// HTTPServer is an HTTP CONNECT proxy that forwards connections via SOCKS5 to slipstream instances.
 type HTTPServer struct {
 	listenAddr     string
 	bufferSize     int
 	maxConnections int
-	manager        *engine.Manager
-	balancer       balancer.Balancer
-	userMgr        *users.Manager
+	socksAddr      string // Address of SOCKS5 server (for balancing)
 	activeConns    atomic.Int64
 	bufPool        sync.Pool
 	connID         atomic.Uint64
-	server         *http.Server
 }
 
-func NewHTTPServer(listenAddr string, bufferSize int, maxConns int, mgr *engine.Manager, bal balancer.Balancer, umgr *users.Manager) *HTTPServer {
+func NewHTTPServer(listenAddr string, socksAddr string, bufferSize int, maxConns int) *HTTPServer {
 	return &HTTPServer{
 		listenAddr:     listenAddr,
+		socksAddr:      socksAddr,
 		bufferSize:     bufferSize,
 		maxConnections: maxConns,
-		manager:        mgr,
-		balancer:       bal,
-		userMgr:        umgr,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, bufferSize)
@@ -110,33 +101,14 @@ func (h *HTTPServer) handleConnection(clientConn net.Conn, connID uint64) {
 	h.handleHTTP(clientConn, req, reader, connID)
 }
 
-// handleConnect implements HTTP CONNECT tunneling (for HTTPS and WebSockets)
+// handleConnect implements HTTP CONNECT tunneling via SOCKS5
 func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connID uint64) {
 	targetHost := req.RequestURI
 
-	// Pick upstream instance
-	healthy := h.manager.HealthyInstances()
-	socksHealthy := make([]*engine.Instance, 0, len(healthy))
-	for _, inst := range healthy {
-		if inst.Config.Mode != "ssh" {
-			socksHealthy = append(socksHealthy, inst)
-		}
-	}
-	if len(socksHealthy) == 0 {
-		clientConn.Write([]byte("HTTP/1.0 503 Service Unavailable\r\n\r\n"))
-		return
-	}
-
-	inst := h.balancer.Pick(socksHealthy)
-	if inst == nil {
-		clientConn.Write([]byte("HTTP/1.0 503 Service Unavailable\r\n\r\n"))
-		return
-	}
-
-	// Dial upstream SOCKS5 proxy
-	upstreamConn, err := inst.Dial()
+	// Connect to SOCKS5 server (which handles balancing internally)
+	upstreamConn, err := net.DialTimeout("tcp", h.socksAddr, 5*time.Second)
 	if err != nil {
-		log.Printf("[proxy-http] conn#%d: dial instance %d failed: %v", connID, inst.ID(), err)
+		log.Printf("[proxy-http] conn#%d: dial SOCKS5 server %s failed: %v", connID, h.socksAddr, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -150,15 +122,15 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		tc.SetWriteBuffer(h.bufferSize)
 	}
 
-	// Build SOCKS5 CONNECT request for target
+	// SOCKS5 greeting + CONNECT request (pipelined)
 	socksReq := h.buildSOCKS5Connect(targetHost)
 	if _, err := upstreamConn.Write(socksReq); err != nil {
-		log.Printf("[proxy-http] conn#%d: write to upstream failed: %v", connID, err)
+		log.Printf("[proxy-http] conn#%d: write to SOCKS5 failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 
-	// Read SOCKS5 response header (4 bytes)
+	// Read SOCKS5 response header (4 bytes: VER + REP + RSV + ATYP)
 	respHeader := make([]byte, 4)
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read response header failed: %v", connID, err)
@@ -166,8 +138,32 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		return
 	}
 
+	// Skip SOCKS5 greeting response (2 bytes) before CONNECT response
+	// Wait, we need to read greeting response first!
+	// Actually, let me re-read the proper SOCKS5 flow...
+	// After we send greeting + CONNECT pipelined, we get:
+	// - Greeting response (2 bytes: VER + METHOD)
+	// - CONNECT response (4+ bytes: VER + REP + RSV + ATYP + ADDR + PORT)
+	// So respHeader is actually the second response? No wait...
+	
+	// Let me fix this properly - read greeting response first
+	greetResp := make([]byte, 2)
+	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
+		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Now read CONNECT response header
+	respHeader = make([]byte, 4)
+	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
+		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
 	if respHeader[1] != 0x00 {
-		log.Printf("[proxy-http] conn#%d: SOCKS5 connect failed: %d", connID, respHeader[1])
+		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed: %d", connID, respHeader[1])
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -190,22 +186,93 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	// Success! Send HTTP 200 to client
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	inst.IncrConns()
-	defer inst.DecrConns()
+	log.Printf("[proxy-http] conn#%d: CONNECT %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
 
-	log.Printf("[proxy-http] conn#%d: CONNECT %s via instance %d", connID, targetHost, inst.ID())
-
-	// Relay data between client and upstream
-	h.relay(clientConn, upstreamConn, inst, nil, connID)
+	// Relay data between client and upstream SOCKS5
+	h.relay(clientConn, upstreamConn, connID)
 }
 
 // handleHTTP handles direct HTTP requests (GET, POST, etc.)
 func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *bufio.Reader, connID uint64) {
-	// For HTTP (not HTTPS), we can also tunnel through SOCKS5
-	// But most clients use CONNECT for HTTPS anyway
-	// This is a fallback for plain HTTP
-
 	if req.URL.Scheme == "" || req.URL.Host == "" {
+		clientConn.Write([]byte("HTTP/1.0 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	targetHost := req.URL.Host
+	if req.URL.Port() == "" {
+		if req.URL.Scheme == "https" {
+			targetHost = req.URL.Host + ":443"
+		} else {
+			targetHost = req.URL.Host + ":80"
+		}
+	}
+
+	// Connect to SOCKS5 server
+	upstreamConn, err := net.DialTimeout("tcp", h.socksAddr, 5*time.Second)
+	if err != nil {
+		log.Printf("[proxy-http] conn#%d: dial SOCKS5 server %s failed: %v", connID, h.socksAddr, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer upstreamConn.Close()
+
+	if tc, ok := upstreamConn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
+		tc.SetNoDelay(true)
+		tc.SetReadBuffer(h.bufferSize)
+		tc.SetWriteBuffer(h.bufferSize)
+	}
+
+	// Send SOCKS5 CONNECT request
+	socksReq := h.buildSOCKS5Connect(targetHost)
+	if _, err := upstreamConn.Write(socksReq); err != nil {
+		log.Printf("[proxy-http] conn#%d: write to SOCKS5 failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Read SOCKS5 greeting response
+	greetResp := make([]byte, 2)
+	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
+		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Read CONNECT response header
+	respHeader := make([]byte, 4)
+	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
+		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	if respHeader[1] != 0x00 {
+		log.Printf("[proxy-http] conn#%d: SOCKS5 CONNECT failed: %d", connID, respHeader[1])
+		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+
+	// Drain bind address + port
+	atyp := respHeader[3]
+	switch atyp {
+	case 0x01: // IPv4
+		io.ReadFull(upstreamConn, make([]byte, 4+2))
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		io.ReadFull(upstreamConn, lenBuf)
+		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
+	case 0x04: // IPv6
+		io.ReadFull(upstreamConn, make([]byte, 16+2))
+	default:
+		io.ReadFull(upstreamConn, make([]byte, 4+2))
+	}
+
+	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
+	h.relay(clientConn, upstreamConn, connID)
+}
 		clientConn.Write([]byte("HTTP/1.0 400 Bad Request\r\n\r\n"))
 		return
 	}
@@ -283,42 +350,42 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 		io.ReadFull(upstreamConn, make([]byte, 4+2))
 	}
 
-	inst.IncrConns()
-	defer inst.DecrConns()
-
-	log.Printf("[proxy-http] conn#%d: HTTP %s via instance %d", connID, targetHost, inst.ID())
-	h.relay(clientConn, upstreamConn, inst, nil, connID)
+	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s", connID, targetHost, h.socksAddr)
+	h.relay(clientConn, upstreamConn, connID)
 }
 
-// buildSOCKS5Connect builds a SOCKS5 CONNECT request for a target host:port
+// buildSOCKS5Connect builds SOCKS5 greeting + CONNECT request for target
+// Returns: VER(1) NMETHODS(1) METHOD(1) + VER(1) CMD(1) RSV(1) ATYP(1) ADDR PORT
 func (h *HTTPServer) buildSOCKS5Connect(targetHostPort string) []byte {
 	// Parse host and port
 	host, port, err := net.SplitHostPort(targetHostPort)
 	if err != nil {
-		// Assume HTTP (80) or HTTPS (443) if not specified
+		// Assume HTTPS (443) if not specified
 		host = targetHostPort
-		port = "80"
+		port = "443"
 	}
 
 	var portNum uint16
 	fmt.Sscanf(port, "%d", &portNum)
 
-	// Build SOCKS5 request
-	// VER=5, CMD=1 (CONNECT), RSV=0, ATYP (1=IPv4, 3=domain), ADDR, PORT
-	req := []byte{0x05, 0x01, 0x00}
+	// SOCKS5 greeting
+	req := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
+
+	// SOCKS5 CONNECT request
+	req = append(req, 0x05, 0x01, 0x00) // VER=5, CMD=1 (CONNECT), RSV=0
 
 	// Try parsing as IPv4
 	if ip := net.ParseIP(host); ip != nil {
 		if ipv4 := ip.To4(); ipv4 != nil {
-			req = append(req, 0x01)       // IPv4
+			req = append(req, 0x01)       // ATYP=1 (IPv4)
 			req = append(req, ipv4...)    // 4 bytes
 		} else {
-			req = append(req, 0x04)       // IPv6
+			req = append(req, 0x04)       // ATYP=4 (IPv6)
 			req = append(req, ip...)      // 16 bytes
 		}
 	} else {
 		// Domain name
-		req = append(req, 0x03)           // Domain
+		req = append(req, 0x03)           // ATYP=3 (Domain)
 		req = append(req, byte(len(host)))
 		req = append(req, []byte(host)...)
 	}
@@ -331,18 +398,13 @@ func (h *HTTPServer) buildSOCKS5Connect(targetHostPort string) []byte {
 }
 
 // relay bidirectional copy between client and upstream
-func (h *HTTPServer) relay(clientConn, upstreamConn net.Conn, inst *engine.Instance, user *users.User, connID uint64) {
+func (h *HTTPServer) relay(clientConn, upstreamConn net.Conn, connID uint64) {
 	var clientToUpstream, upstreamToClient int64
 	done := make(chan struct{}, 2)
 
 	go func() {
-		var dst io.Writer = upstreamConn
-		var src io.Reader = clientConn
-		if user != nil {
-			src = user.WrapReader(src)
-		}
 		bufPtr := h.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
+		n, _ := io.CopyBuffer(upstreamConn, clientConn, *bufPtr)
 		h.bufPool.Put(bufPtr)
 		clientToUpstream = n
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
@@ -352,13 +414,8 @@ func (h *HTTPServer) relay(clientConn, upstreamConn net.Conn, inst *engine.Insta
 	}()
 
 	go func() {
-		var dst io.Writer = clientConn
-		var src io.Reader = upstreamConn
-		if user != nil {
-			dst = user.WrapWriter(dst)
-		}
 		bufPtr := h.bufPool.Get().(*[]byte)
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
+		n, _ := io.CopyBuffer(clientConn, upstreamConn, *bufPtr)
 		h.bufPool.Put(bufPtr)
 		upstreamToClient = n
 		if tc, ok := clientConn.(*net.TCPConn); ok {
@@ -370,7 +427,5 @@ func (h *HTTPServer) relay(clientConn, upstreamConn net.Conn, inst *engine.Insta
 	<-done
 	<-done
 
-	inst.AddTx(clientToUpstream)
-	inst.AddRx(upstreamToClient)
 	log.Printf("[proxy-http] conn#%d: relay closed (tx=%d, rx=%d)", connID, clientToUpstream, upstreamToClient)
 }

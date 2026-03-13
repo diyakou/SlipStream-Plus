@@ -114,9 +114,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start proxy servers (SOCKS5 + HTTP CONNECT)
+	// Start proxy servers (SOCKS5 + HTTP + UDP)
 	httpAddr := deriveHTTPAddr(cfg.Socks.Listen)
+	udpAddr := deriveUDPAddr(cfg.Socks.Listen)
 	log.Printf("HTTP CONNECT proxy will listen on: %s", httpAddr)
+	log.Printf("UDP relay will listen on: %s", udpAddr)
 
 	if hasSSH && !hasSOCKS {
 		log.Printf("Starting in SSH mode (SOCKS5 → SSH tunnel → slipstream)")
@@ -129,16 +131,25 @@ func main() {
 			log.Fatalf("SSH proxy error: %v", err)
 		}
 	} else if !hasSSH && hasSOCKS {
-		log.Printf("Starting in SOCKS+HTTP mode (SOCKS5 & HTTP CONNECT → slipstream)")
+		log.Printf("Starting in SOCKS+HTTP+UDP mode (TCP & UDP → slipstream)")
 		
 		// Start HTTP CONNECT proxy in background
 		httpServer := proxy.NewHTTPServer(
-			httpAddr, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
-			mgr, bal, userMgr,
+			httpAddr, cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
 		)
 		go func() {
 			if err := httpServer.ListenAndServe(); err != nil {
 				log.Fatalf("HTTP proxy error: %v", err)
+			}
+		}()
+
+		// Start UDP relay in background
+		udpRelay := proxy.NewUDPRelay(
+			udpAddr, cfg.Socks.BufferSize, mgr, bal,
+		)
+		go func() {
+			if err := udpRelay.ListenAndServe(); err != nil {
+				log.Fatalf("UDP relay error: %v", err)
 			}
 		}()
 
@@ -151,16 +162,25 @@ func main() {
 			log.Fatalf("SOCKS proxy error: %v", err)
 		}
 	} else if hasSSH && hasSOCKS {
-		log.Printf("Starting in MIXED mode (SSH + SOCKS instances with HTTP CONNECT)")
+		log.Printf("Starting in MIXED mode (SSH + SOCKS instances with HTTP + UDP)")
 		
 		// Start HTTP CONNECT proxy in background
 		httpServer := proxy.NewHTTPServer(
-			httpAddr, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
-			mgr, bal, userMgr,
+			httpAddr, cfg.Socks.Listen, cfg.Socks.BufferSize, cfg.Socks.MaxConnections,
 		)
 		go func() {
 			if err := httpServer.ListenAndServe(); err != nil {
 				log.Fatalf("HTTP proxy error: %v", err)
+			}
+		}()
+
+		// Start UDP relay in background
+		udpRelay := proxy.NewUDPRelay(
+			udpAddr, cfg.Socks.BufferSize, mgr, bal,
+		)
+		go func() {
+			if err := udpRelay.ListenAndServe(); err != nil {
+				log.Fatalf("UDP relay error: %v", err)
 			}
 		}()
 
@@ -189,3 +209,17 @@ func deriveHTTPAddr(socksAddr string) string {
 	// Use 8080 for HTTP proxy (standard)
 	return net.JoinHostPort(host, "8080")
 }
+
+// deriveUDPAddr derives UDP relay address from SOCKS address
+// e.g., "127.0.0.1:1080" → "127.0.0.1:1081"
+func deriveUDPAddr(socksAddr string) string {
+	host, port, err := net.SplitHostPort(socksAddr)
+	if err != nil {
+		// Default to localhost
+		return "127.0.0.1:1081"
+	}
+	var socksPort int
+	fmt.Sscanf(port, "%d", &socksPort)
+	// Use SOCKS port + 1 for UDP relay
+	udpPort := socksPort + 1
+	return net.JoinHostPort(host, fmt.Sprintf("%d", udpPort))
