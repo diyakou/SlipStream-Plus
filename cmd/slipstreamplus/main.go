@@ -189,4 +189,3 @@ func deriveHTTPAddr(socksAddr string) string {
 	// Use 8080 for HTTP proxy (standard)
 	return net.JoinHostPort(host, "8080")
 }
-}
