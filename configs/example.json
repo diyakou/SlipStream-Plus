@@ -1,7 +1,7 @@
 {
   "socks": {
     "listen": "0.0.0.0:1080",
-    "buffer_size": 65536,
+    "buffer_size": 262144,
     "max_connections": 10000
   },
   "mode": "socks",

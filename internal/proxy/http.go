@@ -122,6 +122,9 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 		tc.SetWriteBuffer(h.bufferSize)
 	}
 
+	// Use single handshake buffer to minimize allocations
+	handshakeBuf := make([]byte, 1024)
+
 	// Step 1: Send SOCKS5 greeting
 	greetReq := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
 	if _, err := upstreamConn.Write(greetReq); err != nil {
@@ -131,7 +134,7 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	}
 
 	// Step 2: Read greeting response (2 bytes)
-	greetResp := make([]byte, 2)
+	greetResp := handshakeBuf[:2]
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
@@ -152,7 +155,7 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	}
 
 	// Step 4: Read CONNECT response header (4 bytes: VER + REP + RSV + ATYP)
-	respHeader := make([]byte, 4)
+	respHeader := handshakeBuf[2:6]
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
@@ -169,21 +172,19 @@ func (h *HTTPServer) handleConnect(clientConn net.Conn, req *http.Request, connI
 	atyp := respHeader[3]
 	switch atyp {
 	case 0x01: // IPv4
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:6]) // 4 bytes IPv4 + 2 bytes port
 	case 0x03: // Domain
-		lenBuf := make([]byte, 1)
+		lenBuf := handshakeBuf[:1]
 		io.ReadFull(upstreamConn, lenBuf)
-		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:int(lenBuf[0])+2]) // domain + port
 	case 0x04: // IPv6
-		io.ReadFull(upstreamConn, make([]byte, 16+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:18]) // 16 bytes IPv6 + 2 bytes port
 	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:6])
 	}
 
 	// Success! Send HTTP 200 to client
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	log.Printf("[proxy-http] conn#%d: CONNECT %s via SOCKS5 %s successful", connID, targetHost, h.socksAddr)
 
 	// Relay data between client and upstream SOCKS5
 	h.relay(clientConn, upstreamConn, connID)
@@ -222,6 +223,9 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 		tc.SetWriteBuffer(h.bufferSize)
 	}
 
+	// Use single handshake buffer to minimize allocations
+	handshakeBuf := make([]byte, 1024)
+
 	// Step 1: Send SOCKS5 greeting
 	greetReq := []byte{0x05, 0x01, 0x00} // VER=5, NMETHODS=1, METHOD=0x00 (no auth)
 	if _, err := upstreamConn.Write(greetReq); err != nil {
@@ -231,7 +235,7 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	}
 
 	// Step 2: Read greeting response (2 bytes)
-	greetResp := make([]byte, 2)
+	greetResp := handshakeBuf[:2]
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		log.Printf("[proxy-http] conn#%d: read greeting response failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
@@ -252,7 +256,7 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	}
 
 	// Step 4: Read CONNECT response header
-	respHeader := make([]byte, 4)
+	respHeader := handshakeBuf[2:6]
 	if _, err := io.ReadFull(upstreamConn, respHeader); err != nil {
 		log.Printf("[proxy-http] conn#%d: read CONNECT response header failed: %v", connID, err)
 		clientConn.Write([]byte("HTTP/1.0 502 Bad Gateway\r\n\r\n"))
@@ -269,18 +273,17 @@ func (h *HTTPServer) handleHTTP(clientConn net.Conn, req *http.Request, reader *
 	atyp := respHeader[3]
 	switch atyp {
 	case 0x01: // IPv4
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:6])
 	case 0x03: // Domain
-		lenBuf := make([]byte, 1)
+		lenBuf := handshakeBuf[:1]
 		io.ReadFull(upstreamConn, lenBuf)
-		io.ReadFull(upstreamConn, make([]byte, int(lenBuf[0])+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:int(lenBuf[0])+2])
 	case 0x04: // IPv6
-		io.ReadFull(upstreamConn, make([]byte, 16+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:18])
 	default:
-		io.ReadFull(upstreamConn, make([]byte, 4+2))
+		io.ReadFull(upstreamConn, handshakeBuf[:6])
 	}
 
-	log.Printf("[proxy-http] conn#%d: HTTP %s via SOCKS5 %s successful", connID, targetHost, h.socksAddr)
 	h.relay(clientConn, upstreamConn, connID)
 }
 
@@ -354,5 +357,8 @@ func (h *HTTPServer) relay(clientConn, upstreamConn net.Conn, connID uint64) {
 	<-done
 	<-done
 
-	log.Printf("[proxy-http] conn#%d: relay closed (tx=%d, rx=%d)", connID, clientToUpstream, upstreamToClient)
+	// Only log at debug level to reduce hot path overhead
+	if clientToUpstream > 0 || upstreamToClient > 0 {
+		log.Printf("[proxy-http] conn#%d: relay closed (tx=%d, rx=%d)", connID, clientToUpstream, upstreamToClient)
+	}
 }

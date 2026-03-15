@@ -17,10 +17,11 @@ func (ll *LeastLoad) Pick(instances []*engine.Instance) *engine.Instance {
 		return nil
 	}
 
-	var best *engine.Instance
-	bestLoad := int64(math.MaxInt64)
+	best := instances[0]
+	bestLoad := best.ActiveConns()
 
-	for _, inst := range instances {
+	for i := 1; i < len(instances); i++ {
+		inst := instances[i]
 		load := inst.ActiveConns()
 		if load < bestLoad {
 			bestLoad = load
@@ -28,8 +29,5 @@ func (ll *LeastLoad) Pick(instances []*engine.Instance) *engine.Instance {
 		}
 	}
 
-	if best == nil {
-		return instances[0]
-	}
 	return best
 }

@@ -17,13 +17,16 @@ func (lp *LeastPing) Pick(instances []*engine.Instance) *engine.Instance {
 		return nil
 	}
 
-	var best *engine.Instance
-	bestPing := int64(math.MaxInt64)
+	best := instances[0]
+	bestPing := best.LastPingMs()
+	if bestPing <= 0 {
+		bestPing = math.MaxInt64 - 1
+	}
 
-	for _, inst := range instances {
+	for i := 1; i < len(instances); i++ {
+		inst := instances[i]
 		ping := inst.LastPingMs()
 		if ping <= 0 {
-			// No ping data yet, treat as high latency
 			ping = math.MaxInt64 - 1
 		}
 		if ping < bestPing {
@@ -32,8 +35,5 @@ func (lp *LeastPing) Pick(instances []*engine.Instance) *engine.Instance {
 		}
 	}
 
-	if best == nil {
-		return instances[0]
-	}
 	return best
 }

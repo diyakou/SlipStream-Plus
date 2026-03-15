@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/ParsaKSH/SlipStream-Plus/internal/config"
@@ -20,16 +19,16 @@ import (
 //
 // Latency is only set from successful tunnel probes (real RTT).
 const maxConsecutiveFailures = 3
+const maxConcurrentChecks = 16 // Limit concurrent health checks (prevents goroutine explosion)
 
 type Checker struct {
-	manager  *engine.Manager
-	interval time.Duration
-	timeout  time.Duration
-	ctx      context.Context
-	cancel   context.CancelFunc
-
-	mu       sync.Mutex
-	failures map[int]int
+	manager   *engine.Manager
+	interval  time.Duration
+	timeout   time.Duration
+	ctx       context.Context
+	cancel    context.CancelFunc
+	workCh    chan *engine.Instance
+	workers   int
 }
 
 func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
@@ -46,18 +45,37 @@ func NewChecker(mgr *engine.Manager, cfg *config.HealthCheckConfig) *Checker {
 		timeout:  timeout,
 		ctx:      ctx,
 		cancel:   cancel,
-		failures: make(map[int]int),
+		workCh:   make(chan *engine.Instance, maxConcurrentChecks),
+		workers:  maxConcurrentChecks,
 	}
 }
 
 func (c *Checker) Start() {
+	// Start worker goroutines
+	for i := 0; i < c.workers; i++ {
+		go c.worker()
+	}
+	
+	// Start scheduler
 	go c.run()
-	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, unhealthy_after=%d failures)",
-		c.interval, c.timeout, maxConsecutiveFailures)
+	log.Printf("[health] checker started (interval=%s, tunnel_timeout=%s, unhealthy_after=%d failures, workers=%d)",
+		c.interval, c.timeout, maxConsecutiveFailures, c.workers)
 }
 
 func (c *Checker) Stop() {
 	c.cancel()
+	close(c.workCh)
+}
+
+func (c *Checker) worker() {
+	for inst := range c.workCh {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+			c.checkOne(inst)
+		}
+	}
 }
 
 func (c *Checker) run() {
@@ -89,21 +107,13 @@ func (c *Checker) checkAll() {
 			inst.SetLastPingMs(-1)
 			continue
 		}
-		go c.checkOne(inst)
+		select {
+		case c.workCh <- inst:
+		default:
+			// Worker pool is full, skip this check to prevent blocking
+			log.Printf("[health] skipping health check for instance %d: worker pool full", inst.ID())
+		}
 	}
-}
-
-func (c *Checker) recordSuccess(id int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.failures[id] = 0
-}
-
-func (c *Checker) recordFailure(id int) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.failures[id]++
-	return c.failures[id]
 }
 
 func (c *Checker) checkOne(inst *engine.Instance) {
@@ -111,7 +121,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 	conn, err := net.DialTimeout("tcp", inst.Addr(), 3*time.Second)
 	if err != nil {
 		// Process is not listening → immediately unhealthy
-		failCount := c.recordFailure(inst.ID())
+		failCount := inst.IncrFailures()
 		if inst.State() != engine.StateUnhealthy {
 			log.Printf("[health] instance %d (%s:%d) UNHEALTHY: process not listening: %v",
 				inst.ID(), inst.Config.Domain, inst.Config.Port, err)
@@ -139,7 +149,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 
 	if err != nil {
 		// Tunnel probe failed
-		failCount := c.recordFailure(inst.ID())
+		failCount := inst.IncrFailures()
 		if failCount >= maxConsecutiveFailures {
 			if inst.State() != engine.StateUnhealthy {
 				log.Printf("[health] instance %d (%s:%d) UNHEALTHY after %d tunnel failures: %v",
@@ -160,7 +170,7 @@ func (c *Checker) checkOne(inst *engine.Instance) {
 	}
 
 	// Tunnel probe succeeded → HEALTHY with real latency
-	c.recordSuccess(inst.ID())
+	inst.ResetFailures()
 
 	pingMs := rtt.Milliseconds()
 	if pingMs <= 0 {

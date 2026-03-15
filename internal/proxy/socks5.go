@@ -95,7 +95,10 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 	clientIP := users.ExtractIP(clientConn.RemoteAddr())
 
 	// ──── SOCKS5 Greeting ────
-	buf := make([]byte, 258)
+	// Use buffer from pool to avoid allocation
+	bufPtr := s.bufPool.Get().(*[]byte)
+	defer s.bufPool.Put(bufPtr)
+	buf := *bufPtr
 	if _, err := io.ReadFull(clientConn, buf[:2]); err != nil {
 		return
 	}
@@ -214,7 +217,8 @@ func (s *Server) handleConnection(clientConn net.Conn, connID uint64) {
 
 	// ──── Pick upstream slipstream instance ────
 	healthy := s.manager.HealthyInstances()
-	socksHealthy := make([]*engine.Instance, 0, len(healthy))
+	// Filter once: reuse slice to avoid allocation
+	socksHealthy := healthy[:0] // reset length but keep capacity
 	for _, inst := range healthy {
 		if inst.Config.Mode != "ssh" {
 			socksHealthy = append(socksHealthy, inst)

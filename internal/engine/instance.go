@@ -41,15 +41,16 @@ type Instance struct {
 	Config config.ExpandedInstance
 	Binary string
 
-	mu          sync.RWMutex
-	state       InstanceState
-	cmd         *exec.Cmd
-	activeConns atomic.Int64
-	lastPingMs  atomic.Int64
-	txBytes     atomic.Int64 // total bytes uploaded (client → upstream)
-	rxBytes     atomic.Int64 // total bytes downloaded (upstream → client)
-	stopCh      chan struct{}
-	id          int
+	mu               sync.RWMutex
+	state            InstanceState
+	cmd              *exec.Cmd
+	activeConns      atomic.Int64
+	lastPingMs       atomic.Int64
+	txBytes          atomic.Int64 // total bytes uploaded (client → upstream)
+	rxBytes          atomic.Int64 // total bytes downloaded (upstream → client)
+	consecutiveFailures atomic.Int32 // health check failures (lock-free)
+	stopCh           chan struct{}
+	id               int
 }
 
 func NewInstance(id int, cfg config.ExpandedInstance, binary string) *Instance {
@@ -74,6 +75,10 @@ func (inst *Instance) TxBytes() int64 { return inst.txBytes.Load() }
 func (inst *Instance) RxBytes() int64 { return inst.rxBytes.Load() }
 func (inst *Instance) AddTx(n int64)  { inst.txBytes.Add(n) }
 func (inst *Instance) AddRx(n int64)  { inst.rxBytes.Add(n) }
+
+func (inst *Instance) ResetFailures()               { inst.consecutiveFailures.Store(0) }
+func (inst *Instance) IncrFailures() int32         { return inst.consecutiveFailures.Add(1) }
+func (inst *Instance) ConsecutiveFailures() int32  { return inst.consecutiveFailures.Load() }
 
 func (inst *Instance) State() InstanceState {
 	inst.mu.RLock()

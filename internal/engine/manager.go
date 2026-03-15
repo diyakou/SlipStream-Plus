@@ -74,12 +74,7 @@ func (m *Manager) supervise(inst *Instance) {
 	defer m.wg.Done()
 
 	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		default:
-		}
-
+		// Wait for the instance to exit (this blocks until process dies)
 		err := inst.WaitForExit()
 
 		select {
@@ -101,10 +96,12 @@ func (m *Manager) supervise(inst *Instance) {
 		backoff := 1 * time.Second
 		maxBackoff := 30 * time.Second
 		for attempt := 1; ; attempt++ {
+			// Don't spin-wait: use select with backoff timer
 			select {
 			case <-m.ctx.Done():
 				return
 			case <-time.After(backoff):
+				// Timer fired, try restart
 			}
 
 			log.Printf("[manager] restarting instance %d (%s:%d), attempt %d",

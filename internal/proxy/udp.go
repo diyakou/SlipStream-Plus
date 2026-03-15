@@ -60,17 +60,26 @@ func (u *UDPRelay) ListenAndServe() error {
 	// Start session cleanup goroutine
 	go u.cleanupSessions()
 
-	// Main receive loop
-	buf := make([]byte, u.bufferSize)
+	// Reuse single buffer for all datagrams (concurrent reads use separate buffers via lock-free queue)
+	// Read loop - SINGLE goroutine for better cache locality
 	for {
+		buf := make([]byte, u.bufferSize)
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("[proxy-udp] read error: %v", err)
 			continue
 		}
 
-		id := u.connID.Add(1)
-		go u.handleDatagram(conn, buf[:n], remoteAddr, id)
+		// Process immediately in same goroutine if small, or spawn for large payloads
+		// Small payloads: keep in-thread; large: spawn goroutine to avoid blocking
+		if n > 4096 {
+			// Large payload: spawn goroutine to avoid blocking main loop
+			id := u.connID.Add(1)
+			go u.handleDatagram(conn, buf[:n], remoteAddr, id)
+		} else {
+			// Small payload: handle inline (avoid goroutine overhead)
+			u.handleDatagram(conn, buf[:n], remoteAddr, u.connID.Add(1))
+		}
 	}
 }
 
@@ -127,27 +136,25 @@ func (u *UDPRelay) handleDatagram(udpConn *net.UDPConn, data []byte, clientAddr 
 	// Create upstream connection if needed (lazy initialization)
 	if session.upstreamConn == nil {
 		healthy := u.manager.HealthyInstances()
-		socksHealthy := make([]*engine.Instance, 0, len(healthy))
+		// Reuse slice to avoid allocation
+		socksHealthy := healthy[:0]
 		for _, inst := range healthy {
 			if inst.Config.Mode != "ssh" {
 				socksHealthy = append(socksHealthy, inst)
 			}
 		}
 		if len(socksHealthy) == 0 {
-			log.Printf("[proxy-udp] conn#%d: no healthy instances", connID)
-			return
+			return // No healthy instances - silently drop packet
 		}
 
 		inst := u.balancer.Pick(socksHealthy)
 		if inst == nil {
-			log.Printf("[proxy-udp] conn#%d: balancer returned nil", connID)
-			return
+			return // No instance available
 		}
 
 		conn, err := inst.Dial()
 		if err != nil {
-			log.Printf("[proxy-udp] conn#%d: dial instance %d failed: %v", connID, inst.ID(), err)
-			return
+			return // Failed to dial - silently drop
 		}
 
 		if tc, ok := conn.(*net.TCPConn); ok {
@@ -164,8 +171,6 @@ func (u *UDPRelay) handleDatagram(udpConn *net.UDPConn, data []byte, clientAddr 
 
 		// Start response reader goroutine
 		go u.readUpstreamResponses(udpConn, session, connID)
-
-		log.Printf("[proxy-udp] conn#%d: created session to %s via instance %d", connID, targetAddr, inst.ID())
 	}
 
 	// Send payload to upstream

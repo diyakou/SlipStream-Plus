@@ -263,7 +263,8 @@ func (c *Config) Validate() error {
 	}
 
 	if c.Socks.BufferSize <= 0 {
-		c.Socks.BufferSize = 65536
+		// Increased from 65536 to 262144 (256KB) for better throughput
+		c.Socks.BufferSize = 262144
 	}
 	if c.Socks.MaxConnections <= 0 {
 		c.Socks.MaxConnections = 10000
