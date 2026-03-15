@@ -1,8 +1,6 @@
 package balancer
 
 import (
-	"math"
-
 	"github.com/ParsaKSH/SlipStream-Plus/internal/engine"
 )
 
